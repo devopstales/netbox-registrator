@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Netbox API Automation Script with Auto Device Type Detection
+# Netbox API Automation Script - FIXED VERSION
 # Usage: ./register_server.sh [OPTIONS]
 
 set -euo pipefail
@@ -29,7 +29,7 @@ usage() {
     cat << EOF
 Usage: $0 [OPTIONS]
 
-Register or update a server in Netbox with automatic device type detection.
+Register or update a server in Netbox with automatic device type detection and interface creation.
 
 OPTIONS:
     -n, --name NAME          Device name (required, defaults to hostname if not provided)
@@ -42,12 +42,6 @@ OPTIONS:
     --dry-run                Test mode: show what would be done without making changes
     --debug                  Enable debug output with detailed API responses
     -h, --help               Show this help message
-
-Examples:
-    $0                                  # Auto-detect everything, use hostname as name
-    $0 --dry-run                        # Test mode - show detected data and Netbox status
-    $0 --debug                          # Run with detailed debug output
-    $0 -n backup01                      # Register with specific name
 EOF
 }
 
@@ -114,134 +108,141 @@ debug_print() {
 detect_device_type() {
     debug_print "Starting device type detection..."
     
-    # Method 1: Try dmidecode (most reliable for servers)
     if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
-        debug_print "Trying dmidecode (root mode)..."
         if PRODUCT_NAME=$(dmidecode -s system-product-name 2>/dev/null | tr -d '\0'); then
             if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "To be filled by O.E.M." && "$PRODUCT_NAME" != "None" ]]; then
-                debug_print "dmidecode found: '$PRODUCT_NAME'"
                 echo "$PRODUCT_NAME"
                 return 0
-            else
-                debug_print "dmidecode returned invalid value: '$PRODUCT_NAME'"
             fi
-        else
-            debug_print "dmidecode failed or returned empty"
         fi
-    elif command -v dmidecode >/dev/null 2>&1; then
-        debug_print "dmidecode available but not running as root"
     fi
     
-    # Method 2: Try /sys/class/dmi/id/ (doesn't require root)
     if [[ -f "/sys/class/dmi/id/product_name" ]]; then
-        debug_print "Trying /sys/class/dmi/id/product_name..."
         PRODUCT_NAME=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
         if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "To be filled by O.E.M." && "$PRODUCT_NAME" != "None" ]]; then
-            debug_print "Found in /sys: '$PRODUCT_NAME'"
             echo "$PRODUCT_NAME"
             return 0
-        else
-            debug_print "/sys returned invalid value: '$PRODUCT_NAME'"
-        fi
-    else
-        debug_print "/sys/class/dmi/id/product_name not found"
-    fi
-    
-    # Method 3: Try lshw (requires root for full info)
-    if command -v lshw >/dev/null 2>&1; then
-        debug_print "Trying lshw..."
-        if PRODUCT_NAME=$(lshw -class system -short 2>/dev/null | grep -v "H/W" | head -2 | tail -1 | awk '{print $3,$4,$5}' | xargs); then
-            if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "product:" ]]; then
-                debug_print "lshw found: '$PRODUCT_NAME'"
-                echo "$PRODUCT_NAME"
-                return 0
-            else
-                debug_print "lshw returned invalid value: '$PRODUCT_NAME'"
-            fi
-        else
-            debug_print "lshw failed or returned empty"
         fi
     fi
     
-    # Method 4: Try /proc/cpuinfo for virtual machines
-    if [[ -f "/proc/cpuinfo" ]]; then
-        debug_print "Checking /proc/cpuinfo for VM signatures..."
-        if grep -q "QEMU" /proc/cpuinfo 2>/dev/null; then
-            debug_print "Detected QEMU VM"
-            echo "Virtual Machine (QEMU)"
-            return 0
-        elif grep -q "VMware" /proc/cpuinfo 2>/dev/null; then
-            debug_print "Detected VMware VM"
-            echo "Virtual Machine (VMware)"
-            return 0
-        elif grep -q "Xen" /proc/cpuinfo 2>/dev/null; then
-            debug_print "Detected Xen VM"
-            echo "Virtual Machine (Xen)"
-            return 0
-        elif [[ -f "/sys/hypervisor/type" ]] && [[ "$(cat /sys/hypervisor/type 2>/dev/null)" == "xen" ]]; then
-            debug_print "Detected Xen VM (via sysfs)"
-            echo "Virtual Machine (Xen)"
-            return 0
-        fi
-    fi
-    
-    # Method 5: Check for cloud instances
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        debug_print "Trying systemd-detect-virt..."
-        VIRT_TYPE=$(systemd-detect-virt 2>/dev/null)
-        if [[ "$VIRT_TYPE" != "none" ]]; then
-            debug_print "Detected virtualization: $VIRT_TYPE"
-            echo "Virtual Machine ($VIRT_TYPE)"
-            return 0
-        else
-            debug_print "systemd-detect-virt returned 'none'"
-        fi
-    fi
-    
-    # Fallback: Use generic server type
-    debug_print "All detection methods failed, using fallback"
     echo "Generic Server"
     return 1
 }
 
 # Function to detect serial number automatically
 detect_serial() {
-    debug_print "Starting serial number detection..."
-    
-    # Method 1: dmidecode (requires root)
     if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
-        debug_print "Trying dmidecode for serial (root mode)..."
         if SERIAL_NUM=$(dmidecode -s system-serial-number 2>/dev/null | tr -d '\0'); then
             if [[ -n "$SERIAL_NUM" && "$SERIAL_NUM" != "To be filled by O.E.M." && "$SERIAL_NUM" != "None" ]]; then
-                debug_print "dmidecode found serial: '$SERIAL_NUM'"
                 echo "$SERIAL_NUM"
                 return 0
-            else
-                debug_print "dmidecode returned invalid serial: '$SERIAL_NUM'"
             fi
-        else
-            debug_print "dmidecode serial detection failed"
         fi
     fi
     
-    # Method 2: /sys/class/dmi/id/ (doesn't require root)
     if [[ -f "/sys/class/dmi/id/product_serial" ]]; then
-        debug_print "Trying /sys/class/dmi/id/product_serial..."
         SERIAL_NUM=$(cat /sys/class/dmi/id/product_serial 2>/dev/null)
         if [[ -n "$SERIAL_NUM" && "$SERIAL_NUM" != "To be filled by O.E.M." && "$SERIAL_NUM" != "None" ]]; then
-            debug_print "Found serial in /sys: '$SERIAL_NUM'"
             echo "$SERIAL_NUM"
             return 0
-        else
-            debug_print "/sys returned invalid serial: '$SERIAL_NUM'"
         fi
-    else
-        debug_print "/sys/class/dmi/id/product_serial not found"
     fi
     
-    # No serial found
-    debug_print "Serial detection failed"
     return 1
+}
+
+# Function to detect network interfaces
+detect_network_interfaces() {
+    debug_print "Detecting network interfaces..."
+    
+    if command -v ip >/dev/null 2>&1; then
+        ip -br link show | awk '$1 != "lo" && $1 !~ /^docker/ && $1 !~ /^veth/ && $1 !~ /^br-/ && $1 !~ /^virbr/ {print $1}'
+    elif [[ -d "/sys/class/net" ]]; then
+        for interface in /sys/class/net/*; do
+            interface_name=$(basename "$interface")
+            if [[ "$interface_name" != "lo" ]] && [[ "$interface_name" != docker* ]] && [[ "$interface_name" != veth* ]] && [[ "$interface_name" != br-* ]] && [[ "$interface_name" != virbr* ]]; then
+                echo "$interface_name"
+            fi
+        done
+    fi
+}
+
+# Function to get interface MAC address
+get_interface_mac() {
+    local interface="$1"
+    if [[ -f "/sys/class/net/$interface/address" ]]; then
+        mac=$(cat "/sys/class/net/$interface/address" 2>/dev/null)
+        if [[ "$mac" != "00:00:00:00:00:00" ]] && [[ -n "$mac" ]]; then
+            echo "$mac"
+        fi
+    fi
+}
+
+# Function to get interface speed
+get_interface_speed() {
+    local interface="$1"
+    if [[ -f "/sys/class/net/$interface/speed" ]]; then
+        speed=$(cat "/sys/class/net/$interface/speed" 2>/dev/null)
+        if [[ "$speed" != "-1" ]] && [[ "$speed" != "" ]] && [[ "$speed" =~ ^[0-9]+$ ]]; then
+            echo "$speed"
+        fi
+    fi
+}
+
+# Function to get interface MTU
+get_interface_mtu() {
+    local interface="$1"
+    if [[ -f "/sys/class/net/$interface/mtu" ]]; then
+        mtu=$(cat "/sys/class/net/$interface/mtu" 2>/dev/null)
+        if [[ -n "$mtu" ]] && [[ "$mtu" =~ ^[0-9]+$ ]]; then
+            echo "$mtu"
+        fi
+    fi
+}
+
+# Function to determine interface type
+get_interface_type() {
+    local interface="$1"
+    local speed="$2"
+    
+    if [[ "$interface" == bond* ]]; then
+        echo "lag"
+        return
+    fi
+    
+    if [[ "$interface" == *"br"* ]] || [[ "$interface" == vmbr* ]]; then
+        echo "bridge"
+        return
+    fi
+    
+    if [[ -n "$speed" ]]; then
+        if [[ "$speed" -eq 10 ]]; then
+            echo "10base-t"
+        elif [[ "$speed" -eq 100 ]]; then
+            echo "100base-tx"
+        elif [[ "$speed" -eq 1000 ]]; then
+            echo "1000base-t"
+        elif [[ "$speed" -eq 10000 ]]; then
+            echo "10gbase-t"
+        elif [[ "$speed" -eq 25000 ]]; then
+            echo "25gbase-x-sfp28"
+        elif [[ "$speed" -eq 40000 ]]; then
+            echo "40gbase-x-qsfpp"
+        elif [[ "$speed" -eq 100000 ]]; then
+            echo "100gbase-x-qsfp28"
+        else
+            echo "other"
+        fi
+        return
+    fi
+    
+    if [[ "$interface" == eth* ]] || [[ "$interface" == en* ]] || [[ "$interface" == em* ]]; then
+        echo "1000base-t"
+    elif [[ "$interface" == wlan* ]] || [[ "$interface" == wlp* ]] || [[ "$interface" == wifi* ]]; then
+        echo "ieee802.11a"
+    else
+        echo "other"
+    fi
 }
 
 # Function to make API requests
@@ -253,146 +254,74 @@ api_request() {
     debug_print "API Request: $method $NETBOX_URL/api/$endpoint/"
     if [[ -n "$data" ]]; then
         debug_print "API Payload: $data"
-        local response
-        response=$(curl -sS -X "$method" \
+        curl -sS -X "$method" \
              -H "Authorization: Token $API_TOKEN" \
              -H "Content-Type: application/json" \
              -H "Accept: application/json" \
              -d "$data" \
-             "$NETBOX_URL/api/$endpoint/")
-        debug_print "API Response: $response"
-        echo "$response"
+             "$NETBOX_URL/api/$endpoint/"
     else
-        local response
-        response=$(curl -sS -X "$method" \
+        curl -sS -X "$method" \
              -H "Authorization: Token $API_TOKEN" \
              -H "Accept: application/json" \
-             "$NETBOX_URL/api/$endpoint/")
-        debug_print "API Response: $response"
-        echo "$response"
+             "$NETBOX_URL/api/$endpoint/"
     fi
 }
 
-# Function to get site ID (create if doesn't exist, unless dry-run)
+# Function to get site ID
 get_site_id() {
     local site_name="$1"
-    debug_print "Checking site: $site_name"
     local response
     response=$(api_request "GET" "dcim/sites" "?name=$site_name")
     local site_id
     site_id=$(echo "$response" | jq -r '.results[0].id // empty')
     
     if [[ -z "$site_id" ]]; then
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Site '$site_name': NOT FOUND (would be created)" >&2
-        else
-            debug_print "Site '$site_name' not found, creating..."
-            echo "Site '$site_name' not found. Creating site..." >&2
-            # Create the site
-            local site_payload
-            site_payload=$(jq -n --arg name "$site_name" --arg slug "$(echo "$site_name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')" '{name: $name, slug: $slug}')
-            local create_response
-            create_response=$(api_request "POST" "dcim/sites" "$site_payload")
-            site_id=$(echo "$create_response" | jq -r '.id')
-            if [[ -z "$site_id" ]]; then
-                echo "Error: Failed to create site '$site_name'" >&2
-                debug_print "Site creation failed. Response: $create_response"
-                exit 1
-            fi
-            echo "Site '$site_name' created successfully (ID: $site_id)" >&2
-        fi
-    else
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Site '$site_name': FOUND (ID: $site_id)" >&2
-        fi
-        debug_print "Site found with ID: $site_id"
+        echo "Error: Site '$site_name' not found in Netbox" >&2
+        exit 1
     fi
     echo "$site_id"
 }
 
-# Function to get device role ID (create if doesn't exist, unless dry-run)
+# Function to get device role ID
 get_role_id() {
     local role_name="$1"
-    debug_print "Checking device role: $role_name"
     local response
     response=$(api_request "GET" "dcim/device-roles" "?name=$role_name")
     local role_id
     role_id=$(echo "$response" | jq -r '.results[0].id // empty')
     
     if [[ -z "$role_id" ]]; then
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Device role '$role_name': NOT FOUND (would be created)" >&2
-        else
-            debug_print "Device role '$role_name' not found, creating..."
-            echo "Device role '$role_name' not found. Creating device role..." >&2
-            # Create the device role
-            local role_payload
-            local slug=$(echo "$role_name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
-            role_payload=$(jq -n \
-                --arg name "$role_name" \
-                --arg slug "$slug" \
-                --arg color "0080ff" \
-                '{name: $name, slug: $slug, color: $color, vm_role: false}')
-            local create_response
-            create_response=$(api_request "POST" "dcim/device-roles" "$role_payload")
-            role_id=$(echo "$create_response" | jq -r '.id')
-            if [[ -z "$role_id" ]]; then
-                echo "Error: Failed to create device role '$role_name'" >&2
-                debug_print "Role creation failed. Response: $create_response"
-                exit 1
-            fi
-            echo "Device role '$role_name' created successfully (ID: $role_id)" >&2
+        local role_payload
+        local slug=$(echo "$role_name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+        role_payload=$(jq -n --arg name "$role_name" --arg slug "$slug" --arg color "0080ff" '{name: $name, slug: $slug, color: $color, vm_role: false}')
+        local create_response
+        create_response=$(api_request "POST" "dcim/device-roles" "$role_payload")
+        role_id=$(echo "$create_response" | jq -r '.id')
+        if [[ -z "$role_id" ]]; then
+            echo "Error: Failed to create device role '$role_name'" >&2
+            exit 1
         fi
-    else
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Device role '$role_name': FOUND (ID: $role_id)" >&2
-        fi
-        debug_print "Device role found with ID: $role_id"
     fi
     echo "$role_id"
 }
 
-# Function to get device type ID - FIXED TO MATCH EXACT MODEL
+# Function to get device type ID
 get_device_type_id() {
     local type_name="$1"
-    debug_print "Checking device type: $type_name"
-    
-    # Get all device types and filter locally for exact match
     local response
     response=$(api_request "GET" "dcim/device-types" "")
     local type_id
-    # Use jq to find exact match (case-sensitive)
     type_id=$(echo "$response" | jq -r --arg model "$type_name" '.results[] | select(.model == $model) | .id | tostring | . // empty' | head -n1)
     
+    if [[ -z "$type_id" ]] && [[ "$type_name" == *"+" ]]; then
+        local stripped_name="${type_name%+}"
+        type_id=$(echo "$response" | jq -r --arg model "$stripped_name" '.results[] | select(.model == $model) | .id | tostring | . // empty' | head -n1)
+    fi
+    
     if [[ -z "$type_id" ]]; then
-        # Try without the trailing '+' if it exists
-        if [[ "$type_name" == *"+" ]]; then
-            local stripped_name="${type_name%+}"
-            debug_print "Trying without trailing +: $stripped_name"
-            type_id=$(echo "$response" | jq -r --arg model "$stripped_name" '.results[] | select(.model == $model) | .id | tostring | . // empty' | head -n1)
-            if [[ -n "$type_id" ]]; then
-                debug_print "Found match without +: $stripped_name"
-                echo "$type_id"
-                return 0
-            fi
-        fi
-        
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Device type '$type_name': NOT FOUND (must be created manually)" >&2
-        else
-            echo "Error: Device type '$type_name' not found in Netbox" >&2
-            echo "Please create this device type in Netbox first, or use an existing one." >&2
-            debug_print "Device type lookup failed. Available models:"
-            echo "$response" | jq -r '.results[].model' | while read -r model; do
-                debug_print "  - '$model'"
-            done
-            exit 1
-        fi
-    else
-        if [[ "$DRY_RUN" == true ]]; then
-            echo "  Device type '$type_name': FOUND (ID: $type_id)" >&2
-        fi
-        debug_print "Device type found with ID: $type_id"
+        echo "Error: Device type '$type_name' not found in Netbox" >&2
+        exit 1
     fi
     echo "$type_id"
 }
@@ -400,27 +329,61 @@ get_device_type_id() {
 # Check if device already exists
 check_device_exists() {
     local device_name="$1"
-    debug_print "Checking if device exists: $device_name"
     local response
     response=$(api_request "GET" "dcim/devices" "?name=$device_name")
-    local device_id
-    device_id=$(echo "$response" | jq -r '.results[0].id // empty')
-    debug_print "Device check result: $device_id"
-    echo "$device_id"
+    echo "$response" | jq -r '.results[0].id // empty'
+}
+
+# Get ALL interfaces for device (workaround for API bug)
+get_all_interfaces_for_device() {
+    local device_id="$1"
+    local response
+    response=$(api_request "GET" "dcim/interfaces" "?device_id=$device_id")
+    echo "$response" | jq -r '.results[].name'
+}
+
+# Create interface (with MTU support)
+create_interface() {
+    local device_id="$1"
+    local interface_name="$2"
+    local mac_address="$3"
+    local interface_type="$4"
+    local speed="$5"
+    local mtu="$6"
+    
+    # Build interface payload with MTU
+    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\""
+    
+    if [[ -n "$mac_address" ]]; then
+        interface_payload="$interface_payload,\"mac_address\":\"$mac_address\""
+    fi
+    
+    if [[ -n "$speed" ]]; then
+        interface_payload="$interface_payload,\"speed\":$speed"
+    fi
+    
+    if [[ -n "$mtu" ]]; then
+        interface_payload="$interface_payload,\"mtu\":$mtu"
+    fi
+    
+    interface_payload="$interface_payload}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        debug_print "Creating interface: $interface_payload"
+        local create_response
+        create_response=$(api_request "POST" "dcim/interfaces" "$interface_payload")
+        if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
+            echo "  Created interface: $interface_name"
+        else
+            echo "  Warning: Failed to create interface $interface_name" >&2
+        fi
+    else
+        echo "  Interface '$interface_name' would be created (type: $interface_type${mac_address:+, MAC: $mac_address}${speed:+, Speed: ${speed}Mbps}${mtu:+, MTU: $mtu})"
+    fi
 }
 
 # Main execution
 echo "Starting server registration in Netbox..."
-
-if [[ "$DRY_RUN" == true ]]; then
-    echo "DRY RUN MODE: No changes will be made to Netbox"
-    echo "==============================================="
-fi
-
-if [[ "$DEBUG" == true ]]; then
-    echo "DEBUG MODE: Detailed output enabled"
-    echo "===================================="
-fi
 
 # Auto-detect device type if enabled
 if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
@@ -433,40 +396,16 @@ if [[ -z "$SERIAL" ]]; then
     if SERIAL_DETECTED=$(detect_serial 2>/dev/null); then
         SERIAL="$SERIAL_DETECTED"
         echo "Detected serial number: $SERIAL"
-    else
-        echo "Warning: Could not auto-detect serial number" >&2
     fi
 fi
 
 # Validate required parameters
 if [[ -z "$DEVICE_TYPE" ]]; then
-    echo "Error: Device type is required. Auto-detection failed and no type was specified." >&2
+    echo "Error: Device type is required." >&2
     exit 1
 fi
 
-# Display final configuration
-echo ""
-echo "Final Configuration:"
-echo "  Device Name: $DEVICE_NAME"
-echo "  Device Type: $DEVICE_TYPE"
-echo "  Serial: ${SERIAL:-<not provided>}"
-echo "  Asset Tag: ${ASSET_TAG:-<not provided>}"
-echo "  Site: $DEFAULT_SITE"
-echo "  Role: $DEFAULT_ROLE"
-echo "  Status: $DEFAULT_STATUS"
-if [[ -n "$COMMENTS" ]]; then
-    echo "  Comments: $COMMENTS"
-fi
-if [[ -n "$CUSTOM_FIELDS" ]]; then
-    echo "  Custom Fields: $CUSTOM_FIELDS"
-fi
-echo ""
-
-if [[ "$DRY_RUN" == true ]]; then
-    echo "Checking Netbox object existence:"
-fi
-
-# Get required IDs (will create if they don't exist, unless dry-run)
+# Get required IDs
 SITE_ID=$(get_site_id "$DEFAULT_SITE")
 ROLE_ID=$(get_role_id "$DEFAULT_ROLE")
 DEVICE_TYPE_ID=$(get_device_type_id "$DEVICE_TYPE")
@@ -474,25 +413,10 @@ DEVICE_TYPE_ID=$(get_device_type_id "$DEVICE_TYPE")
 # Check if device exists
 EXISTING_DEVICE_ID=$(check_device_exists "$DEVICE_NAME")
 
-if [[ "$DRY_RUN" == true ]]; then
-    if [[ -n "$EXISTING_DEVICE_ID" ]]; then
-        echo "  Device '$DEVICE_NAME': EXISTS (ID: $EXISTING_DEVICE_ID)"
-        echo ""
-        echo "ACTION: Would UPDATE existing device"
-    else
-        echo "  Device '$DEVICE_NAME': NOT FOUND"
-        echo ""
-        echo "ACTION: Would CREATE new device"
-    fi
-    echo ""
-    echo "Dry run completed successfully. No changes made to Netbox."
-    exit 0
-fi
-
-# Prepare comments (ensure it's never null)
+# Prepare comments
 COMMENTS_PAYLOAD="${COMMENTS:-}"
 
-# Create payload function to avoid quoting issues
+# Create device payload
 create_payload_json() {
     local is_update="$1"
     local json_data="{"
@@ -506,10 +430,6 @@ create_payload_json() {
         json_data="${json_data}\"serial\":\"$SERIAL\","
     fi
     
-    if [[ -n "$ASSET_TAG" ]]; then
-        json_data="${json_data}\"asset_tag\":\"$ASSET_TAG\","
-    fi
-    
     json_data="${json_data}\"comments\":\"$COMMENTS_PAYLOAD\""
     
     if [[ "$is_update" == "true" ]]; then
@@ -520,28 +440,48 @@ create_payload_json() {
     echo "$json_data"
 }
 
-# Register or update device (only if not dry-run)
+# Register or update device
 if [[ -n "$EXISTING_DEVICE_ID" ]]; then
     echo "Device '$DEVICE_NAME' already exists (ID: $EXISTING_DEVICE_ID). Updating..."
     PAYLOAD=$(create_payload_json "true")
-    debug_print "Update payload: $PAYLOAD"
     RESPONSE=$(api_request "PUT" "dcim/devices/$EXISTING_DEVICE_ID" "$PAYLOAD")
+    DEVICE_ID="$EXISTING_DEVICE_ID"
     echo "Device updated successfully!"
 else
     echo "Creating new device '$DEVICE_NAME'..."
     PAYLOAD=$(create_payload_json "false")
-    debug_print "Create payload: $PAYLOAD"
     RESPONSE=$(api_request "POST" "dcim/devices" "$PAYLOAD")
+    DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
+    echo "Device created successfully!"
+fi
+
+# Detect and create network interfaces
+echo "Detecting network interfaces..."
+INTERFACES=$(detect_network_interfaces)
+
+if [[ -n "$INTERFACES" ]]; then
+    echo "Found network interfaces, creating in Netbox..."
     
-    # Check if creation was successful
-    if echo "$RESPONSE" | jq -e '.id' >/dev/null 2>&1; then
-        echo "Device created successfully!"
-    else
-        echo "ERROR: Device creation failed!"
-        if [[ "$DEBUG" == false ]]; then
-            echo "Run with --debug to see detailed error information."
+    # Get existing interfaces to avoid duplicates (workaround for API bug)
+    EXISTING_INTERFACES=$(get_all_interfaces_for_device "$DEVICE_ID")
+    debug_print "Existing interfaces: $(echo "$EXISTING_INTERFACES" | tr '\n' ' ')"
+    
+    while IFS= read -r interface; do
+        if [[ -n "$interface" ]]; then
+            # Skip if interface already exists
+            if echo "$EXISTING_INTERFACES" | grep -Fxq "$interface"; then
+                debug_print "Interface '$interface' already exists, skipping..."
+                continue
+            fi
+            
+            MAC_ADDRESS=$(get_interface_mac "$interface")
+            SPEED=$(get_interface_speed "$interface")
+            MTU=$(get_interface_mtu "$interface")
+            INTERFACE_TYPE=$(get_interface_type "$interface" "$SPEED")
+            create_interface "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU"
         fi
-        debug_print "Creation failed. Response: $RESPONSE"
-        exit 1
-    fi
+    done <<< "$INTERFACES"
+    echo "Network interface creation completed!"
+else
+    echo "No network interfaces detected."
 fi
