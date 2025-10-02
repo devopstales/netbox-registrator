@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Configuration - Update these values for your environment
-NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL (no trailing spaces!)
+NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL
 API_TOKEN="0123456789abcdef0123456789abcdef01234567" # Generate in Netbox: User -> API Tokens
 DEFAULT_SITE="office"                                # Must exist in Netbox
 DEFAULT_ROLE="server"                                # Must exist in Netbox
@@ -14,6 +14,9 @@ DEFAULT_STATUS="active"                              # Options: active, staged, 
 DEFAULT_DEVICE_TYPE=""                               # Optional: specify default device type
 
 # Default values (can be overridden by command line)
+declare -a memory_module_types=()   # For ModuleType creation
+declare -a memory_module_bays=()    # For ModuleBay creation  
+declare -a memory_modules=()        # For Module creation
 DEVICE_NAME=$(hostname -s)
 DEVICE_TYPE=""
 SERIAL=""
@@ -102,14 +105,97 @@ done
 #######################################################################################
 
 # Debug function
-debug_print() {
+_debug_print() {
     if [[ "$DEBUG" == true ]]; then
         echo "DEBUG: $*" >&2
     fi
 }
 
+# Make API requests
+_api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local parameter="$3"
+    local data="$4"
+
+    local end_url
+    if [[ -n "$parameter" ]]; then
+        end_url="$NETBOX_URL/api/$endpoint/$parameter"
+    else
+        end_url="$NETBOX_URL/api/$endpoint/"
+    fi
+
+    if [[ -n "$data" ]]; then
+        _debug_print "API Request: $method $end_url"
+        _debug_print "API Payload: $data"
+        local response
+        response=$(curl -sS -X "$method" \
+             -H "Authorization: Token $API_TOKEN" \
+             -H "Content-Type: application/json" \
+             -H "Accept: application/json" \
+             -d "$data" \
+             "$end_url")
+        _debug_print "API Response: $response"
+        echo "$response"
+    else
+        _debug_print "API Request: $method $end_url"
+        local response
+        response=$(curl -sS -X "$method" \
+             -H "Authorization: Token $API_TOKEN" \
+             -H "Content-Type: application/json" \
+             -H "Accept: application/json" \
+             "$end_url")
+        _debug_print "API Response: $response"
+        echo "$response"
+    fi
+}
+
+_trim() {
+    local var="$*"
+    # Remove leading and trailing whitespace
+    var="${var#"${var%%[![:space:]]*}"}"   # Remove leading
+    var="${var%"${var##*[![:space:]]}"}"   # Remove trailing
+    printf '%s' "$var"
+}
+
+#######################################################################################
+## Manufacturer
+#######################################################################################
+
+_ensure_manufacturer() {
+    local name="$1"
+    # Trim and escape for URL
+    local safe_name
+    safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | gsub(" "; "%20")')
+    
+    # Check if manufacturer exists
+    local resp
+    resp=$(_api_request "GET" "dcim/manufacturers" "?name=$safe_name" "")
+    local count
+    count=$(echo "$resp" | jq -r '.count // 0')
+    
+    if [[ "$count" -eq 0 ]]; then
+        _debug_print "Creating manufacturer: $name"
+        local payload="{\"name\":\"$name\",\"slug\":\"$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '-' | tr -d "'")\"}"
+        _api_request "POST" "dcim/manufacturers" "" "$payload" >/dev/null
+    else
+        _debug_print "Manufacturer exists: $name"
+    fi
+}
+
+#######################################################################################
+## Device
+#######################################################################################
+
+_check_device_exists() {
+    local device_name="$1"
+    local response
+    response=$(_api_request "GET" "dcim/devices" "?name=$device_name" "")
+    echo "$response" | jq -r '.results[0].id // empty'
+}
+
 # Create device payload helper
-create_payload_json() {
+_create_device_payload() {
     local is_update="$1"
     local json_data="{"
     json_data="${json_data}\"name\":\"$DEVICE_NAME\","
@@ -136,63 +222,14 @@ create_payload_json() {
     echo "$json_data"
 }
 
-# Make API requests
-api_request() {
-    local method="$1"
-    local endpoint="$2"
-    local parameter="$3"
-    local data="$4"
-
-    local end_url
-    if [[ -n "$parameter" ]]; then
-        end_url="$NETBOX_URL/api/$endpoint/$parameter"
-    else
-        end_url="$NETBOX_URL/api/$endpoint/"
-    fi
-
-    if [[ -n "$data" ]]; then
-        debug_print "API Request: $method $end_url"
-        debug_print "API Payload: $data"
-        local response
-        response=$(curl -sS -X "$method" \
-             -H "Authorization: Token $API_TOKEN" \
-             -H "Content-Type: application/json" \
-             -H "Accept: application/json" \
-             -d "$data" \
-             "$end_url")
-        debug_print "API Response: $response"
-        echo "$response"
-    else
-        debug_print "API Request: $method $end_url"
-        local response
-        response=$(curl -sS -X "$method" \
-             -H "Authorization: Token $API_TOKEN" \
-             -H "Content-Type: application/json" \
-             -H "Accept: application/json" \
-             "$end_url")
-        debug_print "API Response: $response"
-        echo "$response"
-    fi
-}
-
-#######################################################################################
-## Device
-#######################################################################################
-
-check_device_exists() {
-    local device_name="$1"
-    local response
-    response=$(api_request "GET" "dcim/devices" "?name=$device_name" "")
-    echo "$response" | jq -r '.results[0].id // empty'
-}
 
 #######################################################################################
 ## Device Type
 #######################################################################################
 
 # Function to detect device type automatically
-detect_device_type() {
-    debug_print "Starting device type detection..."
+_detect_device_type() {
+    _debug_print "Starting device type detection..."
     
     if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
         if PRODUCT_NAME=$(dmidecode -s system-product-name 2>/dev/null | tr -d '\0'); then
@@ -216,7 +253,7 @@ detect_device_type() {
 }
 
 # Function to detect serial number automatically
-detect_serial() {
+_detect_serial() {
     if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
         if SERIAL_NUM=$(dmidecode -s system-serial-number 2>/dev/null | tr -d '\0'); then
             if [[ -n "$SERIAL_NUM" && "$SERIAL_NUM" != "To be filled by O.E.M." && "$SERIAL_NUM" != "None" ]]; then
@@ -237,10 +274,10 @@ detect_serial() {
     return 1
 }
 
-get_site_id() {
+_get_site_id() {
     local site_name="$1"
     local response
-    response=$(api_request "GET" "dcim/sites" "?sluge=$site_name" "")
+    response=$(_api_request "GET" "dcim/sites" "?sluge=$site_name" "")
     local site_id
     site_id=$(echo "$response" | jq -r '.results[0].id // empty')
     if [[ -z "$site_id" ]]; then
@@ -250,10 +287,10 @@ get_site_id() {
     echo "$site_id"
 }
 
-get_role_id() {
+_get_role_id() {
     local role_name="$1"
     local response
-    response=$(api_request "GET" "dcim/device-roles" "?name=$role_name" "")
+    response=$(_api_request "GET" "dcim/device-roles" "?name=$role_name" "")
     local role_id
     role_id=$(echo "$response" | jq -r '.results[0].id // empty')
     if [[ -z "$role_id" ]]; then
@@ -261,7 +298,7 @@ get_role_id() {
         local slug=$(echo "$role_name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
         role_payload=$(jq -n --arg name "$role_name" --arg slug "$slug" --arg color "0080ff" '{name: $name, slug: $slug, color: $color, vm_role: false}')
         local create_response
-        create_response=$(api_request "POST" "dcim/device-roles" "" "$role_payload")
+        create_response=$(_api_request "POST" "dcim/device-roles" "" "$role_payload")
         role_id=$(echo "$create_response" | jq -r '.id')
         if [[ -z "$role_id" ]]; then
             echo "Error: Failed to create device role '$role_name'" >&2
@@ -271,10 +308,10 @@ get_role_id() {
     echo "$role_id"
 }
 
-get_device_type_id() {
+_get_device_type_id() {
     local type_name="$1"
     local response
-    response=$(api_request "GET" "dcim/device-types" "" "")
+    response=$(_api_request "GET" "dcim/device-types" "" "")
     local type_id
     type_id=$(echo "$response" | jq -r --arg model "$type_name" '.results[] | select(.model == $model) | .id | tostring | . // empty' | head -n1)
     if [[ -z "$type_id" ]] && [[ "$type_name" == *"+" ]]; then
@@ -293,8 +330,8 @@ get_device_type_id() {
 #######################################################################################
 
 # Function to detect network interfaces and their hierarchy
-detect_network_interfaces() {
-    debug_print "Detecting network interfaces..."
+_detect_network_interfaces() {
+    _debug_print "Detecting network interfaces..."
     
     if command -v ip >/dev/null 2>&1; then
         # Get all interfaces except loopback
@@ -310,7 +347,7 @@ detect_network_interfaces() {
 }
 
 # Function to get interface speed
-get_interface_speed() {
+_get_interface_speed() {
     local interface="$1"
     if [[ -f "/sys/class/net/$interface/speed" ]]; then
         speed=$(cat "/sys/class/net/$interface/speed" 2>/dev/null)
@@ -321,7 +358,7 @@ get_interface_speed() {
 }
 
 # Function to get interface MTU
-get_interface_mtu() {
+_get_interface_mtu() {
     local interface="$1"
     if [[ -f "/sys/class/net/$interface/mtu" ]]; then
         mtu=$(cat "/sys/class/net/$interface/mtu" 2>/dev/null)
@@ -332,7 +369,7 @@ get_interface_mtu() {
 }
 
 # Function to determine interface type
-get_interface_type() {
+_get_interface_type() {
     local interface="$1"
     local speed="$2"
     
@@ -377,7 +414,7 @@ get_interface_type() {
 }
 
 # Function to get interface MAC address (prefer permanent address when available)
-get_interface_mac() {
+_get_interface_mac() {
     local interface="$1"
     
     # Try to get permanent MAC address first using 'ip' command
@@ -386,7 +423,7 @@ get_interface_mac() {
         if [[ -n "$permaddr" ]]; then
             # Validate permanent MAC address format
             if [[ "$permaddr" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-                debug_print "Found permanent MAC address for $interface: $permaddr"
+                _debug_print "Found permanent MAC address for $interface: $permaddr"
                 echo "$permaddr"
                 return
             fi
@@ -401,14 +438,14 @@ get_interface_mac() {
             if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
                 echo "$mac"
             else
-                debug_print "Invalid MAC format for $interface: $mac"
+                _debug_print "Invalid MAC format for $interface: $mac"
             fi
         fi
     fi
 }
 
 # Function to get interface master (for bonding/bridging)
-get_interface_master() {
+_get_interface_master() {
     local interface="$1"
     
     if command -v ip >/dev/null 2>&1; then
@@ -433,136 +470,136 @@ get_interface_master() {
 }
 
 # Get IPv4 addresses assigned to an interface (excluding loopback/link-local)
-get_interface_ipv4_addresses() {
+_get_interface_ipv4_addresses() {
     local interface="$1"
     local output=""
     local exit_code=0
 
-    debug_print "Attempting to get IPv4 addresses for interface: $interface"
+    _debug_print "Attempting to get IPv4 addresses for interface: $interface"
 
     # Use timeout to prevent hanging
     if command -v timeout >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
-        debug_print "Executing with timeout: timeout 10 ip -4 addr show dev \"$interface\" scope global"
+        _debug_print "Executing with timeout: timeout 10 ip -4 addr show dev \"$interface\" scope global"
         output=$(timeout 10 ip -4 addr show dev "$interface" scope global 2>&1) || exit_code=$?
     elif command -v ip >/dev/null 2>&1; then
-        debug_print "Executing without timeout: ip -4 addr show dev \"$interface\" scope global"
+        _debug_print "Executing without timeout: ip -4 addr show dev \"$interface\" scope global"
         output=$(ip -4 addr show dev "$interface" scope global 2>&1) || exit_code=$?
     else
-        debug_print "ERROR: 'ip' command not found."
+        _debug_print "ERROR: 'ip' command not found."
         echo ""
         return 1
     fi
 
     # Check for timeout or command failure
     if [[ $exit_code -eq 124 ]]; then
-        debug_print "ERROR: Command 'ip -4 addr show dev $interface scope global' timed out after 10 seconds."
+        _debug_print "ERROR: Command 'ip -4 addr show dev $interface scope global' timed out after 10 seconds."
         echo ""
         return 1
     elif [[ $exit_code -ne 0 ]]; then
-        debug_print "ERROR: Command 'ip -4 addr show dev $interface scope global' failed with exit code $exit_code. Output: $output"
+        _debug_print "ERROR: Command 'ip -4 addr show dev $interface scope global' failed with exit code $exit_code. Output: $output"
         echo ""
         return 1
     fi
 
-    debug_print "Raw IPv4 output for $interface:\n$output"
+    _debug_print "Raw IPv4 output for $interface:\n$output"
 
     # Process the output to extract the first IP address and its prefix
     if [[ -n "$output" ]]; then
         local ip_prefix
         ip_prefix=$(echo "$output" | awk '/inet / {print $2}' | head -n 1)
         if [[ -n "$ip_prefix" ]]; then
-            debug_print "Parsed IPv4 address/prefix for $interface: $ip_prefix"
+            _debug_print "Parsed IPv4 address/prefix for $interface: $ip_prefix"
             echo "$ip_prefix"
             return 0
         else
-            debug_print "No valid IPv4 address/prefix found in output for $interface."
+            _debug_print "No valid IPv4 address/prefix found in output for $interface."
         fi
     else
-        debug_print "No output received from 'ip -4 addr show dev $interface scope global'."
+        _debug_print "No output received from 'ip -4 addr show dev $interface scope global'."
     fi
     echo ""
     return 1
 }
 
 # Get IPv6 addresses assigned to an interface (excluding link-local, loopback, temporary)
-get_interface_ipv6_addresses() {
+_get_interface_ipv6_addresses() {
     local interface="$1"
     local output=""
     local exit_code=0
 
-    debug_print "Attempting to get IPv6 addresses for interface: $interface"
+    _debug_print "Attempting to get IPv6 addresses for interface: $interface"
 
     # Use timeout to prevent hanging
     if command -v timeout >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
-        debug_print "Executing with timeout: timeout 10 ip -6 addr show dev \"$interface\" scope global -tentative -dadfailed -deprecated"
+        _debug_print "Executing with timeout: timeout 10 ip -6 addr show dev \"$interface\" scope global -tentative -dadfailed -deprecated"
         output=$(timeout 10 ip -6 addr show dev "$interface" scope global -tentative -dadfailed -deprecated 2>&1) || exit_code=$?
     elif command -v ip >/dev/null 2>&1; then
-        debug_print "Executing without timeout: ip -6 addr show dev \"$interface\" scope global -tentative -dadfailed -deprecated"
+        _debug_print "Executing without timeout: ip -6 addr show dev \"$interface\" scope global -tentative -dadfailed -deprecated"
         output=$(ip -6 addr show dev "$interface" scope global -tentative -dadfailed -deprecated 2>&1) || exit_code=$?
     else
-        debug_print "ERROR: 'ip' command not found."
+        _debug_print "ERROR: 'ip' command not found."
         echo ""
         return 1
     fi
 
     # Check for timeout or command failure
     if [[ $exit_code -eq 124 ]]; then
-        debug_print "ERROR: Command 'ip -6 addr show dev $interface ...' timed out after 10 seconds."
+        _debug_print "ERROR: Command 'ip -6 addr show dev $interface ...' timed out after 10 seconds."
         echo ""
         return 1
     elif [[ $exit_code -ne 0 ]]; then
-        debug_print "ERROR: Command 'ip -6 addr show dev $interface ...' failed with exit code $exit_code. Output: $output"
+        _debug_print "ERROR: Command 'ip -6 addr show dev $interface ...' failed with exit code $exit_code. Output: $output"
         echo ""
         return 1
     fi
 
-    debug_print "Raw IPv6 output for $interface:\n$output"
+    _debug_print "Raw IPv6 output for $interface:\n$output"
 
     # Process the output to extract the first IP address and its prefix
     if [[ -n "$output" ]]; then
         local ip_prefix
         ip_prefix=$(echo "$output" | grep -v "temporary\|mngtmpaddr" | awk '/inet6 / {print $2}' | grep -E '^[0-9a-fA-F]*:[0-9a-fA-F:]+' | head -n1)
         if [[ -n "$ip_prefix" ]]; then
-            debug_print "Parsed IPv6 address/prefix for $interface: $ip_prefix"
+            _debug_print "Parsed IPv6 address/prefix for $interface: $ip_prefix"
             echo "$ip_prefix"
             return 0
         else
-            debug_print "No valid IPv6 address/prefix found in output for $interface."
+            _debug_print "No valid IPv6 address/prefix found in output for $interface."
         fi
     else
-        debug_print "No output received from 'ip -6 addr show dev $interface ...'."
+        _debug_print "No output received from 'ip -6 addr show dev $interface ...'."
     fi
     echo ""
     return 1
 }
 
-get_ipv4() {
+_get_ipv4() {
     local interface_name="$1"
     local ipv4_addr
 
-    debug_print "Calling get_interface_ipv4_addresses for $interface_name"
-    ipv4_addr=$(get_interface_ipv4_addresses "$interface_name") || debug_print "get_interface_ipv4_addresses returned non-zero or empty"
-    debug_print "Finished get_interface_ipv4_addresses for $interface_name. Result: '${ipv4_addr:-<empty>}'"
+    _debug_print "Calling _get_interface_ipv4_addresses for $interface_name"
+    ipv4_addr=$(_get_interface_ipv4_addresses "$interface_name") || _debug_print "_get_interface_ipv4_addresses returned non-zero or empty"
+    _debug_print "Finished _get_interface_ipv4_addresses for $interface_name. Result: '${ipv4_addr:-<empty>}'"
 
     if [[ -n "$ipv4_addr" ]]; then
         echo $ipv4_addr
     else
-        debug_print "No IPv4 address detected for $interface_name"
+        _debug_print "No IPv4 address detected for $interface_name"
     fi
 }
 
-get_ipv6() {
+_get_ipv6() {
     local interface_name="$1"
     local ipv6_addr
 
-    debug_print "Calling get_interface_ipv6_addresses for $interface_name"
-    ipv6_addr=$(get_interface_ipv6_addresses "$interface_name") || debug_print "get_interface_ipv6_addresses returned non-zero or empty"
-    debug_print "Finished get_interface_ipv6_addresses for $interface_name. Result: '${ipv6_addr:-<empty>}'"
+    _debug_print "Calling _get_interface_ipv6_addresses for $interface_name"
+    ipv6_addr=$(_get_interface_ipv6_addresses "$interface_name") || _debug_print "_get_interface_ipv6_addresses returned non-zero or empty"
+    _debug_print "Finished _get_interface_ipv6_addresses for $interface_name. Result: '${ipv6_addr:-<empty>}'"
 
     if [[ -n "$ipv6_addr" ]]; then
       echo $ipv6_addr
     else
-        debug_print "No IPv6 address detected for $interface_name"
+        _debug_print "No IPv6 address detected for $interface_name"
     fi
 }
 
@@ -570,10 +607,10 @@ get_ipv6() {
 # Interface
 #######################################################################################
 
-get_interface_details() {
+_get_interface_details() {
     local device_id="$1"
     local response
-    response=$(api_request "GET" "dcim/interfaces" "?device_id=$device_id" "")
+    response=$(_api_request "GET" "dcim/interfaces" "?device_id=$device_id" "")
     echo "$response"
 }
 
@@ -588,14 +625,14 @@ create_or_update_interface() {
 
     # Get existing interface details
     local existing_interface_info
-    existing_interface_info=$(get_interface_details "$device_id")
+    existing_interface_info=$(_get_interface_details "$device_id")
     
     # Get interface details from NetBox
     local interface_id
     interface_id=$(echo "$existing_interface_info" | jq -r --arg name "$interface_name" '.results[] | select(.name == $name) | .id // empty')
 
     # Determine parent interface based on system master interface detection
-    local master_interface=$(get_interface_master "$interface_name")
+    local master_interface=$(_get_interface_master "$interface_name")
     if [[ -n "$master_interface" ]]; then
         # Find the parent interface ID in NetBox
         parent_interface_id=$(echo "$existing_interface_info" | jq -r --arg parent_name "$master_interface" '.results[] | select(.name == $parent_name) | .id // empty')
@@ -619,27 +656,27 @@ create_or_update_interface() {
 
     # Create Interface or Update Interface
     if [[ -n "$interface_id" ]]; then
-        debug_print "Update interface: $interface_payload"
+        _debug_print "Update interface: $interface_payload"
         if [[ "$DRY_RUN" == true ]]; then
             echo "  Interface '$interface_name' would be updated (type: $interface_type${speed:+, Speed: ${speed}Mbps}${mtu:+, MTU: $mtu}${parent_interface_id:+, Parent: $parent_interface_id})"
         else
             local update_response
-            update_response=$(api_request "PATCH" "dcim/interfaces/$interface_id" "" "$interface_payload")
+            update_response=$(_api_request "PATCH" "dcim/interfaces/$interface_id" "" "$interface_payload")
             
             if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
                 echo "  Updated interface: $interface_name (ID: $interface_id)"
             else
                 echo "  Warning: Failed to update interface $interface_name" >&2
-                debug_print "Full response: $update_response"
+                _debug_print "Full response: $update_response"
             fi
         fi
     else
-        debug_print "Create interface: $interface_payload"
+        _debug_print "Create interface: $interface_payload"
         if [[ "$DRY_RUN" == true ]]; then
             echo "  Interface '$interface_name' would be created (type: $interface_type${speed:+, Speed: ${speed}Mbps}${mtu:+, MTU: $mtu}${parent_interface_id:+, Parent: $parent_interface_id})"
         else
             local create_response
-            create_response=$(api_request "POST" "dcim/interfaces" "" "$interface_payload")
+            create_response=$(_api_request "POST" "dcim/interfaces" "" "$interface_payload")
 
             if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
                 local new_interface_id
@@ -647,7 +684,7 @@ create_or_update_interface() {
                 echo "  Created interface: $interface_name (ID: $new_interface_id)"
             else
                 echo "  Warning: Failed to create interface $interface_name" >&2
-                debug_print "Full response: $create_response"
+                _debug_print "Full response: $create_response"
             fi
         fi
     fi
@@ -658,21 +695,21 @@ create_or_update_interface() {
 #######################################################################################
 
 # Function to get all MAC addresses for the device
-get_device_mac_addresses() {
+_get_device_mac_addresses() {
     local device_id="$1"
     local response
-    response=$(api_request "GET" "dcim/mac-addresses" "?device_id=$device_id" "")
+    response=$(_api_request "GET" "dcim/mac-addresses" "?device_id=$device_id" "")
     echo "$response"
 }
 
 # Check if a MAC address object with this specific MAC exists anywhere
-check_mac_address_exists() {
+_check_mac_address_exists() {
     local mac_address="$1"
     # Normalize MAC address to lowercase for API query consistency
     local normalized_mac=$(echo "$mac_address" | tr '[:upper:]' '[:lower:]')
     local response
     # Correct API parameter: mac_address=
-    response=$(api_request "GET" "dcim/mac-addresses" "?mac_address=$normalized_mac" "")
+    response=$(_api_request "GET" "dcim/mac-addresses" "?mac_address=$normalized_mac" "")
 
     response_num=$(echo "$response" | jq '.count' )
 
@@ -686,7 +723,7 @@ check_mac_address_exists() {
         response_mac=$(echo "$response" | jq -r ".results[0].mac_address // \"\"")
         # Compare normalized versions
         if [[ "${response_mac,,}" != "$normalized_mac" ]]; then
-            debug_print "WARNING: API returned MAC address object ID $mac_id with MAC '$response_mac' instead of requested '$normalized_mac'. This indicates an API inconsistency. Treating as if MAC does not exist."
+            _debug_print "WARNING: API returned MAC address object ID $mac_id with MAC '$response_mac' instead of requested '$normalized_mac'. This indicates an API inconsistency. Treating as if MAC does not exist."
             echo ""
             return
         fi
@@ -696,14 +733,14 @@ check_mac_address_exists() {
 }
 
 # Check if a MAC address object with this MAC is already assigned to the specified interface
-check_mac_assigned_to_interface() {
+_check_mac_assigned_to_interface() {
     local mac_address="$1"
     local interface_id="$2"
     # Normalize MAC address to lowercase for API query consistency
     local normalized_mac=$(echo "$mac_address" | tr '[:upper:]' '[:lower:]')
     local response
     # Query all MAC addresses assigned to the interface
-    response=$(api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id" "")
+    response=$(_api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id" "")
 
     # Check if any of the returned MAC addresses match the one we're looking for (case-insensitive)
     local found_id
@@ -713,11 +750,11 @@ check_mac_assigned_to_interface() {
 }
 
 # Check if any MAC address is assigned to a specific interface
-check_mac_assigned_to_interface_any() {
+_check_mac_assigned_to_interface_any() {
     local interface_id="$1"
     local response
     # Query all MAC addresses assigned to the interface
-    response=$(api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id" "")
+    response=$(_api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id" "")
 
     # Return the first MAC address ID found for this interface
     local found_id
@@ -727,7 +764,7 @@ check_mac_assigned_to_interface_any() {
 }
 
 # Check if MAC address is assigned to any interface on the device (excluding the target interface)
-check_mac_assigned_to_other_interface() {
+_check_mac_assigned_to_other_interface() {
     local mac_address="$1"
     local device_id="$2"
     local target_interface_id="$3"
@@ -735,7 +772,7 @@ check_mac_assigned_to_other_interface() {
     local normalized_mac=$(echo "$mac_address" | tr '[:upper:]' '[:lower:]')
     
     local response
-    response=$(api_request "GET" "dcim/mac-addresses" "?device_id=$device_id" "")
+    response=$(_api_request "GET" "dcim/mac-addresses" "?device_id=$device_id" "")
     
     # Find MAC addresses that match the target MAC but are assigned to different interfaces
     local found_id
@@ -748,11 +785,11 @@ check_mac_assigned_to_other_interface() {
 }
 
 # Clean up ALL MAC addresses for the device before reassigning them
-cleanup_all_device_mac_addresses() {
+_cleanup_all_device_mac_addresses() {
     local device_id="$1"
     
     local all_mac_addresses
-    all_mac_addresses=$(get_device_mac_addresses "$device_id")
+    all_mac_addresses=$(_get_device_mac_addresses "$device_id")
     
     # Get all MAC addresses for this device
     local mac_ids_to_cleanup
@@ -766,9 +803,9 @@ cleanup_all_device_mac_addresses() {
                 # Unassign the MAC address from any interface
                 local update_payload="{\"assigned_object_type\":null,\"assigned_object_id\":null}"
                 local update_response
-                update_response=$(api_request "PATCH" "dcim/mac-addresses/$mac_id" "" "$update_payload")
+                update_response=$(_api_request "PATCH" "dcim/mac-addresses/$mac_id" "" "$update_payload")
                 if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
-                    debug_print "Unassigned MAC address object (ID: $mac_id) from device during cleanup"
+                    _debug_print "Unassigned MAC address object (ID: $mac_id) from device during cleanup"
                 else
                     echo "  Warning: Failed to unassign MAC address object (ID: $mac_id) during cleanup" >&2
                 fi
@@ -778,7 +815,7 @@ cleanup_all_device_mac_addresses() {
 }
 
 # Determine interface priority based on NetBox interface attributes
-get_interface_priority() {
+_get_interface_priority() {
     local interface_type="$1"
     local interface_name="$2"
     
@@ -806,12 +843,12 @@ create_or_update_mac_address_object() {
 
     # Get interface details from NetBox
     local existing_interface_info
-    existing_interface_info=$(get_interface_details "$device_id")
+    existing_interface_info=$(_get_interface_details "$device_id")
     local interface_id
     interface_id=$(echo "$existing_interface_info" | jq -r --arg name "$interface_name" '.results[] | select(.name == $name) | .id // empty')
 
     if [[ -z "$interface_id" ]]; then
-        debug_print "Interface '$interface_name' not found for device ID $device_id"
+        _debug_print "Interface '$interface_name' not found for device ID $device_id"
         return 1
     fi
 
@@ -820,15 +857,15 @@ create_or_update_mac_address_object() {
 
     # Check if MAC address object already exists
     local existing_mac_id
-    existing_mac_id=$(check_mac_address_exists "$mac_address")
+    existing_mac_id=$(_check_mac_address_exists "$mac_address")
 
     # Check if MAC is already assigned to the correct interface
     if [[ -n "$existing_mac_id" ]]; then
         local assigned_to_interface_id
-        assigned_to_interface_id=$(check_mac_assigned_to_interface "$mac_address" "$interface_id")
+        assigned_to_interface_id=$(_check_mac_assigned_to_interface "$mac_address" "$interface_id")
         
         if [[ -n "$assigned_to_interface_id" ]]; then
-            debug_print "MAC address $normalized_mac is already correctly assigned to interface ID $interface_id ($interface_name) (MAC object ID: $assigned_to_interface_id)"
+            _debug_print "MAC address $normalized_mac is already correctly assigned to interface ID $interface_id ($interface_name) (MAC object ID: $assigned_to_interface_id)"
             echo "  MAC address $normalized_mac is already correctly assigned to interface '$interface_name' (ID: $interface_id)"
             return 0
         fi
@@ -838,7 +875,7 @@ create_or_update_mac_address_object() {
     if [[ -n "$existing_mac_id" ]]; then
         # Get the interface that currently has this MAC
         local current_mac_details
-        current_mac_details=$(api_request "GET" "dcim/mac-addresses/$existing_mac_id" "" "")
+        current_mac_details=$(_api_request "GET" "dcim/mac-addresses/$existing_mac_id" "" "")
         local current_interface_id
         current_interface_id=$(echo "$current_mac_details" | jq -r '.assigned_object_id // empty')
         
@@ -854,8 +891,8 @@ create_or_update_mac_address_object() {
                 # Get priorities
                 local current_priority
                 local new_priority
-                current_priority=$(get_interface_priority "$current_interface_type" "$current_interface_name")
-                new_priority=$(get_interface_priority "$interface_type" "$interface_name")
+                current_priority=$(_get_interface_priority "$current_interface_type" "$current_interface_name")
+                new_priority=$(_get_interface_priority "$interface_type" "$interface_name")
                 
                 # Only reassign if new interface has higher priority
                 if [[ "$new_priority" -gt "$current_priority" ]]; then
@@ -865,21 +902,21 @@ create_or_update_mac_address_object() {
                         # Update the existing MAC object to assign it to the higher priority interface
                         local update_payload="{\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
                         local update_response
-                        update_response=$(api_request "PATCH" "dcim/mac-addresses/$existing_mac_id" "" "$update_payload")
+                        update_response=$(_api_request "PATCH" "dcim/mac-addresses/$existing_mac_id" "" "$update_payload")
 
                         if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
                             echo "  Reassigned MAC address object (ID: $existing_mac_id) for $normalized_mac from '$current_interface_name' to '$interface_name' (higher priority: $new_priority > $current_priority)"
                             return 0
                         else
                             echo "  Warning: Failed to reassign MAC address object for $normalized_mac" >&2
-                            debug_print "Response: $update_response"
+                            _debug_print "Response: $update_response"
                             return 1
                         fi
                     fi
                     return 0
                 else
                     # Current interface has higher or equal priority, keep it there
-                    debug_print "MAC address $normalized_mac remains on higher priority interface '$current_interface_name' (priority: $current_priority >= $new_priority)"
+                    _debug_print "MAC address $normalized_mac remains on higher priority interface '$current_interface_name' (priority: $current_priority >= $new_priority)"
                     echo "  MAC address $normalized_mac remains on interface '$current_interface_name' (higher priority: $current_priority >= $new_priority)"
                     return 0
                 fi
@@ -897,9 +934,9 @@ create_or_update_mac_address_object() {
             echo "  MAC address object for $normalized_mac would be created and linked to interface '$interface_name' (ID: $interface_id)"
             return 0
         else
-            debug_print "Creating MAC address object with payload: $mac_payload"
+            _debug_print "Creating MAC address object with payload: $mac_payload"
             local create_response
-            create_response=$(api_request "POST" "dcim/mac-addresses" "" "$mac_payload")
+            create_response=$(_api_request "POST" "dcim/mac-addresses" "" "$mac_payload")
 
             if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
                 local new_mac_id
@@ -908,13 +945,13 @@ create_or_update_mac_address_object() {
                 return 0
             else
                 echo "  Warning: Failed to create MAC address object for $normalized_mac" >&2
-                debug_print "Response: $create_response"
+                _debug_print "Response: $create_response"
                 return 1
             fi
         fi
     else
         # MAC exists but we're not reassigning it (lower priority)
-        debug_print "MAC address $normalized_mac remains on current interface (lower priority interface '$interface_name' skipped)"
+        _debug_print "MAC address $normalized_mac remains on current interface (lower priority interface '$interface_name' skipped)"
         return 0
     fi
 }
@@ -930,20 +967,20 @@ create_ip_address() {
     
     # Check if IP address already exists
     local existing_ip_id
-    existing_ip_id=$(api_request "GET" "ipam/ip-addresses" "?address=$ip_address" "" | jq -r '.results[0].id // empty')
+    existing_ip_id=$(_api_request "GET" "ipam/ip-addresses" "?address=$ip_address" "" | jq -r '.results[0].id // empty')
     
     if [[ -n "$existing_ip_id" ]]; then
         echo "  IP address $ip_address already exists (ID: $existing_ip_id)"
         # Check if it's assigned to the correct interface
         local current_assignment
-        current_assignment=$(api_request "GET" "ipam/ip-addresses/$existing_ip_id" "" "" | jq -r '.assigned_object_id // empty')
+        current_assignment=$(_api_request "GET" "ipam/ip-addresses/$existing_ip_id" "" "" | jq -r '.assigned_object_id // empty')
         if [[ "$current_assignment" != "$interface_id" ]]; then
             if [[ "$DRY_RUN" == true ]]; then
                 echo "  IP address $ip_address would be reassigned from interface $current_assignment to $interface_id"
             else
                 local update_payload="{\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
                 local update_response
-                update_response=$(api_request "PATCH" "ipam/ip-addresses/$existing_ip_id" "" "$update_payload")
+                update_response=$(_api_request "PATCH" "ipam/ip-addresses/$existing_ip_id" "" "$update_payload")
                 if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
                     echo "  Reassigned IP address $ip_address to interface ID $interface_id"
                 else
@@ -961,9 +998,9 @@ create_ip_address() {
         echo "  IP address $ip_address would be created and assigned to interface ID $interface_id"
         return 0
     else
-        debug_print "Creating IP address with payload: $ip_payload"
+        _debug_print "Creating IP address with payload: $ip_payload"
         local create_response
-        create_response=$(api_request "POST" "ipam/ip-addresses" "" "$ip_payload")
+        create_response=$(_api_request "POST" "ipam/ip-addresses" "" "$ip_payload")
         
         if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
             local new_ip_id
@@ -972,7 +1009,7 @@ create_ip_address() {
             return 0
         else
             echo "  Warning: Failed to create IP address for $ip_address" >&2
-            debug_print "Response: $create_response"
+            _debug_print "Response: $create_response"
             return 1
         fi
     fi
@@ -982,19 +1019,19 @@ create_ip_address() {
 # IPAM Detection
 #######################################################################################
 
-ipam_test() {
+_ipam_test() {
     if ! command -v ipmitool >/dev/null 2>&1; then
-        debug_print "ipmitool not found, skipping IPMI detection."
+        _debug_print "ipmitool not found, skipping IPMI detection."
         return 1
     else
         return 0
     fi
 }
 
-has_ipmi_interface() {
-    if ipam_test; then
+_has_ipmi_interface() {
+    if _ipam_test; then
         if ! ipmitool mc info >/dev/null 2>&1; then
-            debug_print "IPMI interface not available or not accessible."
+            _debug_print "IPMI interface not available or not accessible."
             return 1
         fi
     fi
@@ -1015,7 +1052,7 @@ create_ipmi_interface() {
     ipmi_mac=$(echo "$output" | awk -F': ' '/^MAC Address[[:space:]]*:/ {print $2; exit}')
 
     # test console port on device
-    if has_ipmi_interface; then
+    if _has_ipmi_interface; then
         # Display information
         cat << EOF
   Interface: IPAM
@@ -1027,6 +1064,7 @@ EOF
 
         # Create missing console ports
         create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" ""
+        echo ""
         echo "  IPMI interface created."
 
         # Create Mac address
@@ -1040,12 +1078,265 @@ EOF
         # Create IP address
         if [[ -n "$ipmi_ip" ]]; then
             echo "  IPv4 Address found: $ipmi_ip"
-            create_ip_address "$ipmi_ip" "$(get_interface_details "$device_id" | jq -r --arg name "IPMI" '.results[] | select(.name == $name) | .id // empty')"
+            create_ip_address "$ipmi_ip" "$(_get_interface_details "$device_id" | jq -r --arg name "IPMI" '.results[] | select(.name == $name) | .id // empty')"
         else
             echo "  No IPv4 Address detected for IPMI"
         fi
 
     fi
+}
+
+#######################################################################################
+# CPU
+#######################################################################################
+
+
+#######################################################################################
+# Memory
+#######################################################################################
+
+_gather_memory_for_netbox() {
+    local device_id="$1"  # NetBox device ID or name
+
+    # Clear global arrays
+    memory_module_types=()
+    memory_module_bays=()
+    memory_modules=()
+
+    # ... [dmidecode execution logic - same as before] ...
+    if ! command -v dmidecode &> /dev/null; then
+        echo "Error: dmidecode not installed" >&2
+        return 1
+    fi
+
+    local dmidecode_cmd="dmidecode -t 17"
+    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t 17"
+    
+    local output
+    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
+        echo "Error: dmidecode failed" >&2
+        return 1
+    }
+    [[ -z "$output" ]] && { echo "Error: No memory data" >&2; return 1; }
+
+    local size type speed manufacturer part_number serial locator bank_locator
+    local in_device=false
+
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        
+        if [[ "$line" == "Memory Device" ]]; then
+            size=""; type=""; speed=""; manufacturer=""; part_number=""; serial=""; locator=""; bank_locator=""
+            in_device=true
+            continue
+        elif [[ -z "$line" ]] && [[ "$in_device" == true ]]; then
+            _process_memory_device "$device_id" "$size" "$type" "$speed" "$manufacturer" "$part_number" "$serial" "$locator" "$bank_locator"
+            in_device=false
+        elif [[ "$in_device" == true ]] && [[ -n "$line" ]]; then
+            case "$line" in
+                "Size:"*)           size="$(_trim "${line#*: }")" ;;
+                "Type:"*)           type="$(_trim "${line#*: }")" ;;
+                "Speed:"*)          speed="$(_trim "${line#*: }")" ;;
+                "Manufacturer:"*)   manufacturer="$(_trim "${line#*: }")" ;;
+                "Part Number:"*)    part_number="$(_trim "${line#*: }")" ;;
+                "Serial Number:"*)  serial="$(_trim "${line#*: }")" ;;
+                "Locator:"*)        locator="$(_trim "${line#*: }")" ;;
+                "Bank Locator:"*)   bank_locator="$(_trim "${line#*: }")" ;;
+            esac
+        fi
+    done <<< "$output"
+
+    # Handle last device
+    if [[ "$in_device" == true ]]; then
+        _process_memory_device "$device_id" "$size" "$type" "$speed" "$manufacturer" "$part_number" "$serial" "$locator" "$bank_locator"
+    else
+        _debug_print "No device found"
+    fi
+}
+
+_process_memory_device() {
+    local device_id="$1" size="$2" type="$3" speed="$4" manufacturer="$5" part_number="$6" serial="$7" locator="$8" bank_locator="$9"
+
+    # Skip empty slots
+    [[ -z "$size" ]] || [[ "$size" == "No Module Installed"* ]] && return 0
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Escape values for JSON (only for string fields)
+    manufacturer="${manufacturer//\"/\\\"}"
+    part_number="${part_number//\"/\\\"}"
+    serial="${serial//\"/\\\"}"
+    locator="${locator//\"/\\\"}"
+    bank_locator="${bank_locator//\"/\\\"}"
+
+    # === Parse profile properties ===
+    # Extract size as integer (from "16 GB" → 16)
+    local size_gb
+    size_gb=$(echo "$size" | sed 's/[^0-9]*//g')
+    [[ -z "$size_gb" ]] && size_gb=0
+
+    # Map memory type to profile enum
+    local mem_class
+    case "$type" in
+        *DDR5*|DDR5) mem_class="DDR5" ;;
+        *DDR4*|DDR4) mem_class="DDR4" ;;
+        *DDR3*|DDR3) mem_class="DDR3" ;;
+        *) mem_class="DDR3" ;;  # fallback
+    esac
+
+    # Extract speed as integer (from "1600 MT/s" → 1600)
+    local speed_mts
+    speed_mts=$(echo "$speed" | sed 's/[^0-9]*//g')
+    [[ -z "$speed_mts" ]] && speed_mts=0
+
+    # ECC detection (optional - default false)
+    # For now, we'll set to false, but you can enhance this later
+    local ecc="false"
+
+    # 1. MODULE TYPE (reusable template) - PROFILE PROPERTIES AT TOP LEVEL
+    local module_type_json="{"
+    module_type_json+="\"profile\":5,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$part_number\","
+    module_type_json+="\"part_number\":\"$part_number\","
+    module_type_json+="\"size\":$size_gb,"
+    module_type_json+="\"class\":\"$mem_class\","
+    module_type_json+="\"data_rate\":$speed_mts,"
+    module_type_json+="\"ecc\":$ecc"
+    module_type_json+="}"
+    memory_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (slot on device)
+    local bay_description="$bank_locator"
+    [[ -n "$bank_locator" ]] && bay_description="Bank: $bank_locator"
+    local bay_json="{\"device\":$device_id,\"name\":\"$locator\",\"description\":\"$bay_description\"}"
+    memory_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed instance)
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$locator\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$part_number\"}"
+    [[ -n "$serial" ]] && module_json+=",\"serial\":\"$serial\""
+    module_json+="}"
+    memory_modules+=("$module_json")
+}
+
+_create_memory_module_in_netbox() {
+    local device_id="$1"
+    echo "Detecting Memory Items..."
+    _gather_memory_for_netbox "$device_id" || return 1
+    _debug_print "Memory Modules: ${memory_modules[@]}"
+
+    echo "Creating memory module in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (idempotent: check if exists first)
+    for mt_json in "${memory_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        
+        if [[ -n "$manuf" ]] && [[ -n "$model" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "ModuleType already exists: $manuf / $model"
+            fi
+        fi
+    done
+
+    # 2. Create ModuleBays AND store their IDs
+    declare -A module_bay_id_map
+    for bay_json in "${memory_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            
+            if [[ "$bay_count" -eq 0 ]]; then
+                _debug_print "Creating ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                # Extract ID from response (handles curl + HTTP code)
+                local bay_id
+                if [[ "$bay_resp" == *"id"* ]]; then
+                    bay_id=$(echo "$bay_resp" | sed 's/.*\([0-9][0-9]*\)$/\1/' | jq -r '.id // empty')
+                else
+                    bay_id=$(echo "${bay_resp%???}" | jq -r '.id // empty')
+                fi
+                if [[ -n "$bay_id" ]]; then
+                    module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new ModuleBay: $bay_name"
+                fi
+            else
+                _debug_print "ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules
+    for mod_json in "${memory_modules[@]}"; do
+        local mod_bay_name
+        mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]]; then
+            if [[ -n "${module_bay_id_map[$mod_bay_name]}" ]]; then
+                local bay_id="${module_bay_id_map[$mod_bay_name]}"
+                local mod_exists
+                mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+                local mod_count
+                mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+                
+                if [[ "$mod_count" -eq 0 ]]; then
+                    _debug_print "Creating Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$mod_json" >/dev/null
+                else
+                    _debug_print "Module already exists in bay: $mod_bay_name"
+                fi
+            else
+                _debug_print "ERROR: No ModuleBay ID found for: $mod_bay_name"
+            fi
+        fi
+    done
+
+    echo "Memory module sync completed."
+}
+
+#######################################################################################
+# Disks
+#######################################################################################
+
+
+#######################################################################################
+# Netbox Modules
+#######################################################################################
+
+create_modules() {
+    local device_id="$1"
+    memory_items=()  # Clear global array
+    #disk_items=()  # Clear global array
+
+    echo ""
+    _create_memory_module_in_netbox "$device_id"
+
 }
 
 #######################################################################################
@@ -1055,7 +1346,7 @@ echo "Starting server registration in NetBox..."
 
 # Auto-detect device type if enabled
 if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
-    DEVICE_TYPE=$(detect_device_type)
+    DEVICE_TYPE=$(_detect_device_type)
     echo "Detected device type: $DEVICE_TYPE"
     if [[ -z "$DEVICE_TYPE" ]]; then
         echo "Error: Device type is required." >&2
@@ -1065,35 +1356,35 @@ fi
 
 # Auto-detect serial if not provided
 if [[ -z "$SERIAL" ]]; then
-    if SERIAL_DETECTED=$(detect_serial 2>/dev/null); then
+    if SERIAL_DETECTED=$(_detect_serial 2>/dev/null); then
         SERIAL="$SERIAL_DETECTED"
         echo "Detected serial number: $SERIAL"
     fi
 fi
 
 # Get required IDs
-SITE_ID=$(get_site_id "$DEFAULT_SITE")
-ROLE_ID=$(get_role_id "$DEFAULT_ROLE")
-DEVICE_TYPE_ID=$(get_device_type_id "$DEVICE_TYPE")
+SITE_ID=$(_get_site_id "$DEFAULT_SITE")
+ROLE_ID=$(_get_role_id "$DEFAULT_ROLE")
+DEVICE_TYPE_ID=$(_get_device_type_id "$DEVICE_TYPE")
 
 # Prepare comments
 COMMENTS_PAYLOAD="${COMMENTS:-}"
 
 # Check if device exists
-EXISTING_DEVICE_ID=$(check_device_exists "$DEVICE_NAME")
+EXISTING_DEVICE_ID=$(_check_device_exists "$DEVICE_NAME")
 
 # Register or update device
 echo ""
 if [[ -n "$EXISTING_DEVICE_ID" ]]; then
     echo "Device '$DEVICE_NAME' already exists (ID: $EXISTING_DEVICE_ID). Updating..."
-    PAYLOAD=$(create_payload_json "true")
-    RESPONSE=$(api_request "PUT" "dcim/devices/$EXISTING_DEVICE_ID" "" "$PAYLOAD")
+    PAYLOAD=$(_create_device_payload "true")
+    RESPONSE=$(_api_request "PUT" "dcim/devices/$EXISTING_DEVICE_ID" "" "$PAYLOAD")
     DEVICE_ID="$EXISTING_DEVICE_ID"
     echo "Device updated successfully!"
 else
     echo "Creating new device '$DEVICE_NAME'..."
-    PAYLOAD=$(create_payload_json "false")
-    RESPONSE=$(api_request "POST" "dcim/devices" "" "$PAYLOAD")
+    PAYLOAD=$(_create_device_payload "false")
+    RESPONSE=$(_api_request "POST" "dcim/devices" "" "$PAYLOAD")
     DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
     echo "Device created successfully!"
 fi
@@ -1101,7 +1392,7 @@ echo ""
 
 # Detect and create network interfaces
 echo "Detecting network interfaces..."
-INTERFACES=$(detect_network_interfaces)
+INTERFACES=$(_detect_network_interfaces)
 
 if [[ -n "$INTERFACES" ]]; then
     echo "Found network interfaces, creating in NetBox..."
@@ -1122,7 +1413,7 @@ if [[ -n "$INTERFACES" ]]; then
     interface_array_json="${interface_array_json}]"
     
     # Clean up ALL MAC addresses for the device before reassigning them
-    #cleanup_all_device_mac_addresses "$DEVICE_ID"
+    #_cleanup_all_device_mac_addresses "$DEVICE_ID"
 
     # Process each interface
     while IFS= read -r interface; do
@@ -1131,13 +1422,13 @@ if [[ -n "$INTERFACES" ]]; then
         echo "Processing interface: $interface"
 
         # Gather interface properties with error handling
-        MASTER=$(get_interface_master "$interface") || MASTER=""
-        SPEED=$(get_interface_speed "$interface") || SPEED=""
-        INTERFACE_TYPE=$(get_interface_type "$interface" "$SPEED") || INTERFACE_TYPE="other"
-        MTU=$(get_interface_mtu "$interface") || MTU=""
-        MAC_ADDRESS=$(get_interface_mac "$interface") || MAC_ADDRESS=""
-        IPV4_ADDRESS=$(get_ipv4 "$interface") || IPV4_ADDRESS=""
-        IPV6_ADDRESS=$(get_ipv6 "$interface") || IPV6_ADDRESS=""
+        MASTER=$(_get_interface_master "$interface") || MASTER=""
+        SPEED=$(_get_interface_speed "$interface") || SPEED=""
+        INTERFACE_TYPE=$(_get_interface_type "$interface" "$SPEED") || INTERFACE_TYPE="other"
+        MTU=$(_get_interface_mtu "$interface") || MTU=""
+        MAC_ADDRESS=$(_get_interface_mac "$interface") || MAC_ADDRESS=""
+        IPV4_ADDRESS=$(_get_ipv4 "$interface") || IPV4_ADDRESS=""
+        IPV6_ADDRESS=$(_get_ipv6 "$interface") || IPV6_ADDRESS=""
 
         # Display information
         cat << EOF
@@ -1164,14 +1455,14 @@ EOF
 
         if [[ -n "$IPV4_ADDRESS" ]]; then
             echo "  IPv4 Address found: $IPV4_ADDRESS"
-            create_ip_address "$IPV4_ADDRESS" "$(get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
+            create_ip_address "$IPV4_ADDRESS" "$(_get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
         else
             echo "  No IPv4 Address detected for $interface"
         fi
 
         if [[ -n "$IPV6_ADDRESS" ]]; then
             echo "  IPv6 Address found: $IPV6_ADDRESS"
-            create_ip_address "$IPV6_ADDRESS" "$(get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
+            create_ip_address "$IPV6_ADDRESS" "$(_get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
         else
             echo "  No IPv6 Address detected for $interface"
         fi
@@ -1187,5 +1478,9 @@ fi
 # Create Console Port
 create_ipmi_interface "$DEVICE_ID"
 
+# Create module items
+create_modules "$DEVICE_ID"
+
 echo ""
 echo "Server registration completed!"
+
