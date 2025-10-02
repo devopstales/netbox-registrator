@@ -14,10 +14,17 @@ DEFAULT_STATUS="active"                              # Options: active, staged, 
 DEFAULT_DEVICE_TYPE=""                               # Optional: specify default device type
 
 # Default values (can be overridden by command line)
+declare -a cpu_module_types=()
+declare -a cpu_module_bays=()
+declare -a cpu_modules=()
 declare -a memory_module_types=()   # For ModuleType creation
 declare -a memory_module_bays=()    # For ModuleBay creation  
 declare -a memory_modules=()        # For Module creation
-DEVICE_NAME=$(hostname -s)
+declare -a disk_module_types=()
+declare -a disk_module_bays=()
+declare -a disk_modules=()
+
+DEVICE_NAME=$(hostname -f)
 DEVICE_TYPE=""
 SERIAL=""
 ASSET_TAG=""
@@ -957,7 +964,7 @@ create_or_update_mac_address_object() {
 }
 
 #######################################################################################
-# IP Address
+# IPMI
 #######################################################################################
 
 # Function to create IP address in NetBox
@@ -1041,6 +1048,7 @@ _has_ipmi_interface() {
 create_ipmi_interface() {
     local device_id="$1"
 
+    echo ""
     echo "Detecting IMPI interface..."
     # Run ipmitool and capture output
     local output
@@ -1090,6 +1098,211 @@ EOF
 # CPU
 #######################################################################################
 
+_gather_cpu_for_netbox() {
+    local device_id="$1"
+    cpu_module_types=()
+    cpu_module_bays=()
+    cpu_modules=()
+
+    if ! command -v dmidecode &> /dev/null; then
+        echo "Error: dmidecode not installed" >&2
+        return 1
+    fi
+
+    local dmidecode_cmd="dmidecode -t processor"
+    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t processor"
+    
+    local output
+    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
+        echo "Error: dmidecode failed" >&2
+        return 1
+    }
+    [[ -z "$output" ]] && { echo "Error: No CPU data" >&2; return 1; }
+
+    local socket_designation manufacturer version core_count thread_count current_speed
+    local in_processor=false
+
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        
+        if [[ "$line" == "Processor Information" ]]; then
+            socket_designation=""; manufacturer=""; version=""; core_count=""; thread_count=""; current_speed=""
+            in_processor=true
+            continue
+        elif [[ -z "$line" ]] && [[ "$in_processor" == true ]]; then
+            _process_cpu_device "$device_id" "$socket_designation" "$manufacturer" "$version" "$core_count" "$thread_count" "$current_speed"
+            in_processor=false
+        elif [[ "$in_processor" == true ]] && [[ -n "$line" ]]; then
+            case "$line" in
+                "Socket Designation:"*)  socket_designation="$(_trim "${line#*: }")" ;;
+                "Manufacturer:"*)        manufacturer="$(_trim "${line#*: }")" ;;
+                "Version:"*)             version="$(_trim "${line#*: }")" ;;
+                "Core Count:"*)          core_count="$(_trim "${line#*: }")" ;;
+                "Thread Count:"*)        thread_count="$(_trim "${line#*: }")" ;;
+                "Current Speed:"*)       current_speed="$(_trim "${line#*: }")" ;;
+            esac
+        fi
+    done <<< "$output"
+
+    if [[ "$in_processor" == true ]]; then
+        _process_cpu_device "$device_id" "$socket_designation" "$manufacturer" "$version" "$core_count" "$thread_count" "$current_speed"
+    fi
+}
+
+_process_cpu_device() {
+    local device_id="$1" socket="$2" manufacturer="$3" version="$4" cores="$5" threads="$6" speed="$7"
+
+    # Skip empty or disabled CPUs
+    [[ -z "$socket" ]] || [[ "$version" == *"Not Specified"* ]] || [[ "$version" == *"Not Installed"* ]] && return 0
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Escape strings for JSON
+    socket="${socket//\"/\\\"}"
+    manufacturer="${manufacturer//\"/\\\"}"
+    version="${version//\"/\\\"}"
+
+    # Parse numeric values
+    local core_count=${cores:-0}
+    local thread_count=${threads:-$core_count}
+    local clock_speed=0
+    if [[ -n "$speed" ]]; then
+        clock_speed=$(echo "$speed" | sed 's/[^0-9.]*//g')
+        # Convert MHz to GHz if needed
+        if (( $(echo "$clock_speed > 10000" | bc -l 2>/dev/null || echo "0") )); then
+            clock_speed=$(echo "scale=2; $clock_speed / 1000" | bc -l 2>/dev/null)
+        fi
+    fi
+
+    # CPU model name
+    local cpu_model="$version"
+    [[ "$cpu_model" == *"CPU"* ]] || [[ "$cpu_model" == *"Processor"* ]] || cpu_model="$socket"
+
+    # 1. MODULE TYPE (CPU template) - using profile ID 1
+    local module_type_json="{"
+    module_type_json+="\"profile\":1,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$cpu_model\","
+    module_type_json+="\"part_number\":\"$cpu_model\","
+    module_type_json+="\"cores\":$core_count,"
+    module_type_json+="\"threads\":$thread_count,"
+    module_type_json+="\"clock_speed\":$clock_speed,"
+    module_type_json+="\"socket\":\"$socket\""
+    module_type_json+="}"
+    cpu_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (CPU socket on device)
+    local bay_json="{\"device\":$device_id,\"name\":\"$socket\",\"description\":\"CPU Socket\",\"label\":\"CPU\"}"
+    cpu_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed CPU instance) - NOTE: We'll fix the payload later using bay ID
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$socket\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$cpu_model\"}}"
+    cpu_modules+=("$module_json")
+}
+
+_create_cpu_module_in_netbox() {
+    local device_id="$1"
+    declare -A cpu_module_type_map
+    declare -A cpu_module_bay_id_map
+
+    echo "Detecting CPU Items..."
+    _gather_cpu_for_netbox "$device_id" || return 1
+
+    echo "  Creating CPU modules in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (deduplicated)
+    for mt_json in "${cpu_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        local key="${manuf}_${model}"
+        
+        if [[ -n "$manuf" ]] && [[ -n "$model" ]] && [[ -z "${cpu_module_type_map[$key]:-}" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating CPU ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "CPU ModuleType already exists: $manuf / $model"
+            fi
+            cpu_module_type_map["$key"]=1
+        fi
+    done
+
+    # 2. Create ModuleBays AND store IDs (with proper URL encoding)
+    for bay_json in "${cpu_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            # Properly URL encode the bay name for GET requests
+            local encoded_bay_name
+            encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "  Creating CPU ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id
+                bay_id=$(echo "${bay_resp%???}" | jq -r '.id // empty' 2>/dev/null || echo "")
+                if [[ -n "$bay_id" ]]; then
+                    cpu_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created CPU ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new CPU ModuleBay: $bay_name"
+                fi
+            else
+                echo "  CPU ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    cpu_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing CPU ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing CPU ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules using ModuleBay IDs
+    for mod_json in "${cpu_modules[@]}"; do
+        local mod_bay_name
+        mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]]; then
+            if [[ -n "${cpu_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+                local bay_id="${cpu_module_bay_id_map[$mod_bay_name]}"
+                # Check if module exists using ModuleBay ID
+                local mod_exists
+                mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+                local mod_count
+                mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+                
+                if [[ "$mod_count" -eq 0 ]]; then
+                    # Fix payload to use bay ID instead of name
+                    local fixed_mod_json
+                    fixed_mod_json=$(echo "$mod_json" | jq --arg id "$bay_id" '.module_bay = ($id | tonumber)' 2>/dev/null || echo "$mod_json")
+                    echo "Creating CPU Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
+                else
+                    echo "CPU Module already exists in bay: $mod_bay_name"
+                fi
+            else
+                _debug_print "ERROR: No CPU ModuleBay ID found for: $mod_bay_name"
+            fi
+        fi
+    done
+
+    echo "CPU module sync completed."
+}
 
 #######################################################################################
 # Memory
@@ -1210,7 +1423,7 @@ _process_memory_device() {
     # 2. MODULE BAY (slot on device)
     local bay_description="$bank_locator"
     [[ -n "$bank_locator" ]] && bay_description="Bank: $bank_locator"
-    local bay_json="{\"device\":$device_id,\"name\":\"$locator\",\"description\":\"$bay_description\"}"
+    local bay_json="{\"device\":$device_id,\"name\":\"$locator\",\"description\":\"$bay_description\",\"label\":\"RAM\"}"
     memory_module_bays+=("$bay_json")
 
     # 3. MODULE (installed instance)
@@ -1226,7 +1439,7 @@ _create_memory_module_in_netbox() {
     _gather_memory_for_netbox "$device_id" || return 1
     _debug_print "Memory Modules: ${memory_modules[@]}"
 
-    echo "Creating memory module in NetBox for device ID: $device_id"
+    _debug_print "Creating memory module in NetBox for device ID: $device_id"
 
     # 1. Create ModuleTypes (idempotent: check if exists first)
     for mt_json in "${memory_module_types[@]}"; do
@@ -1252,7 +1465,7 @@ _create_memory_module_in_netbox() {
     done
 
     # 2. Create ModuleBays AND store their IDs
-    declare -A module_bay_id_map
+    declare -A memory_module_bay_id_map
     for bay_json in "${memory_module_bays[@]}"; do
         local bay_name
         bay_name=$(echo "$bay_json" | jq -r '.name // empty')
@@ -1263,7 +1476,7 @@ _create_memory_module_in_netbox() {
             bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
             
             if [[ "$bay_count" -eq 0 ]]; then
-                _debug_print "Creating ModuleBay: $bay_name"
+                echo "  Creating ModuleBay: $bay_name"
                 local bay_resp
                 bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
                 # Extract ID from response (handles curl + HTTP code)
@@ -1274,17 +1487,17 @@ _create_memory_module_in_netbox() {
                     bay_id=$(echo "${bay_resp%???}" | jq -r '.id // empty')
                 fi
                 if [[ -n "$bay_id" ]]; then
-                    module_bay_id_map["$bay_name"]="$bay_id"
+                    memory_module_bay_id_map["$bay_name"]="$bay_id"
                     _debug_print "Created ModuleBay $bay_name with ID: $bay_id"
                 else
                     _debug_print "ERROR: Failed to get ID for new ModuleBay: $bay_name"
                 fi
             else
-                _debug_print "ModuleBay already exists: $bay_name"
+                echo "ModuleBay already exists: $bay_name"
                 local bay_id
                 bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
                 if [[ -n "$bay_id" ]]; then
-                    module_bay_id_map["$bay_name"]="$bay_id"
+                    memory_module_bay_id_map["$bay_name"]="$bay_id"
                     _debug_print "Existing ModuleBay $bay_name has ID: $bay_id"
                 else
                     _debug_print "ERROR: Failed to get ID for existing ModuleBay: $bay_name"
@@ -1298,18 +1511,18 @@ _create_memory_module_in_netbox() {
         local mod_bay_name
         mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
         if [[ -n "$mod_bay_name" ]]; then
-            if [[ -n "${module_bay_id_map[$mod_bay_name]}" ]]; then
-                local bay_id="${module_bay_id_map[$mod_bay_name]}"
+            if [[ -n "${memory_module_bay_id_map[$mod_bay_name]}" ]]; then
+                local bay_id="${memory_module_bay_id_map[$mod_bay_name]}"
                 local mod_exists
                 mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
                 local mod_count
                 mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
                 
                 if [[ "$mod_count" -eq 0 ]]; then
-                    _debug_print "Creating Module in bay: $mod_bay_name"
+                    echo "  Creating Module in bay: $mod_bay_name"
                     _api_request "POST" "dcim/modules" "" "$mod_json" >/dev/null
                 else
-                    _debug_print "Module already exists in bay: $mod_bay_name"
+                    echo "  Module already exists in bay: $mod_bay_name"
                 fi
             else
                 _debug_print "ERROR: No ModuleBay ID found for: $mod_bay_name"
@@ -1320,23 +1533,328 @@ _create_memory_module_in_netbox() {
     echo "Memory module sync completed."
 }
 
+
 #######################################################################################
 # Disks
 #######################################################################################
 
+_gather_disks_for_netbox() {
+    local device_id="$1"
+    disk_module_types=()
+    disk_module_bays=()
+    disk_modules=()
+
+    echo "Detecting Hard Disks..."
+
+    if ! command -v smartctl &> /dev/null; then
+        _debug_print "ERROR: smartmontools not installed (required for disk inventory)"
+        return 1
+    fi
+
+    # Get list of physical disks
+    local disks
+    disks=$(lsblk -d -n -o NAME 2>/dev/null | grep -E '^[a-z]+[0-9]*$')
+    _debug_print "Found disk devices: $(echo "$disks" | tr '\n' ' ')"
+
+    if [[ -z "$disks" ]]; then
+        _debug_print "No disks found by lsblk"
+        return 0
+    fi
+
+    local disk_count=0
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        ((disk_count++))
+        _debug_print "Processing disk: /dev/$name"
+
+        # Get SMART info - your controller works with direct access!
+        local smart_info
+        smart_info=$(smartctl -i "/dev/$name" 2>/dev/null)
+        
+        if [[ -z "$smart_info" ]] || [[ "$smart_info" == *"Read Device Identity failed"* ]]; then
+            _debug_print "ERROR: smartctl failed for /dev/$name"
+            continue
+        fi
+
+        _debug_print "SMART data length: $(echo "$smart_info" | wc -c) bytes"
+
+        # Extract fields from SMART data - USE EXACT FIELD NAMES FROM YOUR OUTPUT
+        local model serial interface rpm size_gb
+
+        # Model - EXACT field name from your output: "Device Model:"
+        model=$(echo "$smart_info" | grep "^Device Model:" | sed 's/Device Model:[[:space:]]*//')
+        _debug_print "Extracted model: '$model'"
+        [[ -z "$model" ]] && model="Unknown"
+
+        # Serial - EXACT field name: "Serial Number:"
+        serial=$(echo "$smart_info" | grep "^Serial Number:" | sed 's/Serial Number:[[:space:]]*//')
+        _debug_print "Extracted serial: '$serial'"
+
+        # Interface - your drives show "SATA Version is:" but they're SAS drives
+        # Since you have LSI MegaRAID, assume SAS for enterprise drives
+        interface="SAS"
+        if [[ "$model" == *"SSD"* ]] || [[ "$model" == *"EVO"* ]]; then
+            interface="SATA"
+        fi
+        _debug_print "Detected interface: '$interface'"
+
+        # RPM - EXACT field name: "Rotation Rate:"
+        rpm=0
+        local rotation_line
+        rotation_line=$(echo "$smart_info" | grep "^Rotation Rate:")
+        if [[ -n "$rotation_line" ]]; then
+            if [[ "$rotation_line" == *"solid state"* ]]; then
+                rpm=0
+            else
+                rpm=$(echo "$rotation_line" | grep -o '[0-9]*' | head -1)
+            fi
+        elif [[ "$model" == *"SSD"* ]] || [[ "$model" == *"EVO"* ]]; then
+            rpm=0
+        else
+            rpm=7200  # Default for your enterprise drives
+        fi
+        _debug_print "Final RPM: $rpm"
+
+        # Size in GB (from lsblk) - fix the command and whitespace
+        size_gb=0
+        local size_str
+        size_str=$(lsblk -d -n -o SIZE "/dev/$name" 2>/dev/null | tr -d ' ')
+        _debug_print "Raw size from lsblk: '$size_str'"
+        if [[ -n "$size_str" ]] && [[ "$size_str" =~ ^([0-9.]+)([KMGT])$ ]]; then
+            local num="${BASH_REMATCH[1]}"
+            local unit="${BASH_REMATCH[2]}"
+            case "$unit" in
+                K) size_gb=$(echo "scale=0; $num / 1024 / 1024" | bc -l 2>/dev/null || echo "0") ;;
+                M) size_gb=$(echo "scale=0; $num / 1024" | bc -l 2>/dev/null || echo "0") ;;
+                G) size_gb=$(echo "scale=0; $num" | bc -l 2>/dev/null || echo "0") ;;
+                T) size_gb=$(echo "scale=0; $num * 1024" | bc -l 2>/dev/null || echo "0") ;;
+            esac
+        fi
+        size_gb=${size_gb:-0}  # Ensure it's always a number
+        _debug_print "Final size in GB: $size_gb"
+
+        if [[ "$model" == "Unknown" ]]; then
+            _debug_print "Skipping disk with unknown model"
+            continue
+        fi
+
+        _debug_print "Successfully processed disk: $name -> $model ($size_gb GB, $interface, $rpm RPM)"
+        _process_disk_device "$device_id" "$name" "$model" "$size_gb" "$interface" "$serial" "$rpm" ""
+    done <<< "$disks"
+
+    _debug_print "Total disks processed: $disk_count"
+    _debug_print "Disk module types to create: ${#disk_module_types[@]}"
+    _debug_print "Disk module bays to create: ${#disk_module_bays[@]}"
+    _debug_print "Disk modules to create: ${#disk_modules[@]}"
+}
+
+_get_disk_manufacturer() {
+    local disk_name="$1"
+    local model="$2"
+    
+    # Method 1: Try /sys/block/*/device/vendor (most reliable)
+    local vendor
+    vendor=$(cat "/sys/block/$disk_name/device/vendor" 2>/dev/null | _trim)
+    if [[ -n "$vendor" ]] && [[ "$vendor" != "ATA" ]] && [[ "$vendor" != "INTEL" ]]; then
+        echo "$vendor"
+        return 0
+    fi
+
+    # Method 2: Try SMART "Vendor" field
+    local smart_vendor
+    smart_vendor=$(smartctl -i "/dev/$disk_name" 2>/dev/null | grep -i "^Vendor:" | sed 's/Vendor:[[:space:]]*//' | _trim)
+    if [[ -n "$smart_vendor" ]]; then
+        echo "$smart_vendor"
+        return 0
+    fi
+
+    # Method 3: Fallback to model-based detection (your current logic)
+    if [[ "$model" == *"Samsung"* ]] || [[ "$model" == *"SAMSUNG"* ]]; then
+        echo "Samsung"
+    elif [[ "$model" == *"Seagate"* ]] || [[ "$model" == *"SEAGATE"* ]] || [[ "$model" == ST* ]] || [[ "$model" == *"ST"* ]]; then
+        echo "Seagate"
+    elif [[ "$model" == *"Western Digital"* ]] || [[ "$model" == *"WDC"* ]] || [[ "$model" == *"WD"* ]]; then
+        echo "Western Digital"
+    elif [[ "$model" == *"Toshiba"* ]] || [[ "$model" == *"TOSHIBA"* ]]; then
+        echo "Toshiba"
+    elif [[ "$model" == *"Intel"* ]] || [[ "$model" == *"INTEL"* ]]; then
+        echo "Intel"
+    elif [[ "$model" == *"Micron"* ]] || [[ "$model" == *"MICRON"* ]]; then
+        echo "Micron"
+    elif [[ "$model" == *"HGST"* ]] || [[ "$model" == *"Hitachi"* ]] || [[ "$model" == *"HITACHI"* ]]; then
+        echo "HGST"
+    else
+        echo "Unknown"
+    fi
+}
+
+_process_disk_device() {
+    local device_id="$1" name="$2" model="$3" size_gb="$4" interface="$5" serial="$6" rpm="$7" form_factor="$8"
+
+    # Get manufacturer directly from system
+    local manufacturer
+    manufacturer=$(_get_disk_manufacturer "$name" "$model")
+    _ensure_manufacturer "$manufacturer"
+
+    # Map interface to profile "type" field
+    local disk_type="HDD"
+    if [[ $rpm -eq 0 ]]; then
+        disk_type="SSD"
+    elif [[ "$interface" == "NVME" ]]; then
+        disk_type="NVME"
+    else
+        disk_type="HDD"
+    fi
+
+    # Escape strings for JSON (but don't trim model/serial!)
+    name="${name//\"/\\\"}"
+    model="${model//\"/\\\"}"
+    serial="${serial//\"/\\\"}"
+    manufacturer="${manufacturer//\"/\\\"}"
+
+    # Ensure size_gb and rpm are numbers (default to 0 if empty)
+    size_gb=${size_gb:-0}
+    rpm=${rpm:-0}
+
+    # 1. MODULE TYPE (disk template) - using profile ID 4 with correct field names
+    local module_type_json="{"
+    module_type_json+="\"profile\":4,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$model\","
+    module_type_json+="\"part_number\":\"$model\","
+    module_type_json+="\"size\":$size_gb,"          # ← matches profile field "size"
+    module_type_json+="\"speed\":$rpm,"            # ← matches profile field "speed"  
+    module_type_json+="\"type\":\"$disk_type\""    # ← matches profile field "type"
+    module_type_json+="}"
+    disk_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (disk bay on device)
+    local bay_name="DISK-$name"
+    local bay_json="{\"device\":$device_id,\"name\":\"$bay_name\",\"description\":\"Disk Bay for /dev/$name\",\"label\":\"Storage\"}"
+    disk_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed disk instance)
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$bay_name\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$model\"}"
+    [[ -n "$serial" ]] && module_json+=",\"serial\":\"$serial\""
+    module_json+="}"
+    disk_modules+=("$module_json")
+}
+
+_create_disk_module_in_netbox() {
+    local device_id="$1"
+    echo "Detecting Disk Items..."
+    _gather_disks_for_netbox "$device_id" || return 1
+
+    echo "  Creating disk modules in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (deduplicated)
+    declare -A disk_module_type_map
+    for mt_json in "${disk_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        local key="${manuf}_${model}"
+        
+        if [[ -n "$manuf" ]] && [[ -n "$model" ]] && [[ -z "${disk_module_type_map[$key]:-}" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating Disk ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "Disk ModuleType already exists: $manuf / $model"
+            fi
+            disk_module_type_map["$key"]=1
+        fi
+    done
+
+    # 2. Create ModuleBays AND store IDs
+    declare -A disk_module_bay_id_map
+    for bay_json in "${disk_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local encoded_bay_name
+            encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "  Creating Disk ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id
+                bay_id=$(echo "$bay_resp" | jq -r '.id // empty' 2>/dev/null)
+                if [[ -n "$bay_id" ]]; then
+                    disk_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created Disk ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new Disk ModuleBay: $bay_name"
+                fi
+            else
+                echo "  Disk ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    disk_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing Disk ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing Disk ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules using ModuleBay IDs
+    for mod_json in "${disk_modules[@]}"; do
+        local mod_bay_name
+        mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]]; then
+            if [[ -n "${disk_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+                local bay_id="${disk_module_bay_id_map[$mod_bay_name]}"
+                local mod_exists
+                mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+                local mod_count
+                mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+                
+                if [[ "$mod_count" -eq 0 ]]; then
+                    local fixed_mod_json
+                    fixed_mod_json=$(echo "$mod_json" | jq --arg id "$bay_id" '.module_bay = ($id | tonumber)' 2>/dev/null)
+                    echo "  Creating Disk Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
+                else
+                    echo "  Disk Module already exists in bay: $mod_bay_name"
+                fi
+            else
+                _debug_print "ERROR: No Disk ModuleBay ID found for: $mod_bay_name"
+            fi
+        fi
+    done
+
+    echo "Disk module sync completed."
+}
 
 #######################################################################################
 # Netbox Modules
 #######################################################################################
+# Module pyte custom atributes
+## CPU
+# architecture, cores, speed
+## RAM
+# data_rate, size
 
 create_modules() {
     local device_id="$1"
-    memory_items=()  # Clear global array
-    #disk_items=()  # Clear global array
 
     echo ""
+    _create_cpu_module_in_netbox "$device_id"
     _create_memory_module_in_netbox "$device_id"
-
+    _create_disk_module_in_netbox "$device_id"
 }
 
 #######################################################################################

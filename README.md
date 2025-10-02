@@ -10,7 +10,7 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
 * Create IPMI interface if found
 * Update existing `Device` and `Interface`
-* Local inventory using `Modules` for RAM
+* Local inventory using `Modules` for CPU, RAM
 
 # Requirements
 
@@ -21,3 +21,9 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 - ipmitool
 - lldpd
 - lshw
+
+## Inventory Optional requirement
+- hpassacli
+- hpacucli
+- storcli
+- omreport
