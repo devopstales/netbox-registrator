@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Netbox API Automation Script - FIXED VERSION
+# Netbox API Automation Script - FIXED VERSION with MAC Address Objects and Interface Hierarchy
 # Usage: ./register_server.sh [OPTIONS]
 
 set -euo pipefail
 
 # Configuration - Update these values for your environment
-NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL
+NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL (no trailing spaces!)
 API_TOKEN="0123456789abcdef0123456789abcdef01234567" # Generate in Netbox: User -> API Tokens
 DEFAULT_SITE="office"                                # Must exist in Netbox
 DEFAULT_ROLE="server"                                # Must exist in Netbox
@@ -151,11 +151,12 @@ detect_serial() {
     return 1
 }
 
-# Function to detect network interfaces
+# Function to detect network interfaces and their hierarchy
 detect_network_interfaces() {
     debug_print "Detecting network interfaces..."
     
     if command -v ip >/dev/null 2>&1; then
+        # Get all interfaces except loopback
         ip -br link show | awk '$1 != "lo" && $1 !~ /^docker/ && $1 !~ /^veth/ && $1 !~ /^br-/ && $1 !~ /^virbr/ {print $1}'
     elif [[ -d "/sys/class/net" ]]; then
         for interface in /sys/class/net/*; do
@@ -167,15 +168,88 @@ detect_network_interfaces() {
     fi
 }
 
-# Function to get interface MAC address
+# Function to get interface MAC address (prefer permanent address when available)
 get_interface_mac() {
     local interface="$1"
+    
+    # Try to get permanent MAC address first using 'ip' command
+    if command -v ip >/dev/null 2>&1; then
+        permaddr=$(ip link show "$interface" 2>/dev/null | grep -o 'permaddr [0-9a-fA-F:]\{17\}' | cut -d' ' -f2 | head -n1)
+        if [[ -n "$permaddr" ]]; then
+            # Validate permanent MAC address format
+            if [[ "$permaddr" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                debug_print "Found permanent MAC address for $interface: $permaddr"
+                echo "$permaddr"
+                return
+            fi
+        fi
+    fi
+    
+    # Fallback to regular MAC address if no permanent address found
     if [[ -f "/sys/class/net/$interface/address" ]]; then
         mac=$(cat "/sys/class/net/$interface/address" 2>/dev/null)
         if [[ "$mac" != "00:00:00:00:00:00" ]] && [[ -n "$mac" ]]; then
-            echo "$mac"
+            # Validate MAC address format
+            if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                echo "$mac"
+            else
+                debug_print "Invalid MAC format for $interface: $mac"
+            fi
         fi
     fi
+}
+
+# Function to get interface master (for bonding/bridging)
+get_interface_master() {
+    local interface="$1"
+    
+    if command -v ip >/dev/null 2>&1; then
+        # Check if interface has a master
+        master=$(ip link show "$interface" 2>/dev/null | grep -o 'master [^[:space:]]\+' | cut -d' ' -f2 | head -n1)
+        if [[ -n "$master" ]]; then
+            echo "$master"
+            return
+        fi
+    fi
+    
+    # Fallback to sysfs
+    if [[ -L "/sys/class/net/$interface/master" ]]; then
+        master_name=$(basename "$(readlink "/sys/class/net/$interface/master" 2>/dev/null)")
+        if [[ -n "$master_name" ]]; then
+            echo "$master_name"
+            return
+        fi
+    fi
+    
+    echo ""
+}
+
+# Function to determine if interface should have MAC address assigned
+should_assign_mac_address() {
+    local interface="$1"
+    
+    # Get the master of this interface
+    local master
+    master=$(get_interface_master "$interface")
+    
+    if [[ -n "$master" ]]; then
+        debug_print "Interface $interface has master $master"
+        
+        # Check if this is a physical interface in a bond (like eno1, eno2 in bond0)
+        # These should get their permanent MAC address assigned
+        if [[ "$interface" =~ ^(eno|eth|enp|ens|enx)[0-9]+$ ]]; then
+            debug_print "Interface $interface is a physical interface with master, will assign permanent MAC address"
+            return 0  # Yes, assign MAC address (preferably permanent)
+        fi
+        
+        # For other types of slaves, don't assign MAC
+        debug_print "Interface $interface is a slave, will not assign MAC address"
+        return 1
+    fi
+    
+    # This interface has no master, so assign MAC address
+    debug_print "Interface $interface has no master, will assign MAC address"
+    return 0
 }
 
 # Function to get interface speed
@@ -251,20 +325,31 @@ api_request() {
     local endpoint="$2"
     local data="$3"
     
-    debug_print "API Request: $method $NETBOX_URL/api/$endpoint/"
+    # Trim any trailing whitespace from NETBOX_URL
+    local trimmed_url="${NETBOX_URL% }"
+    
     if [[ -n "$data" ]]; then
+        debug_print "API Request: $method $trimmed_url/api/$endpoint/"
         debug_print "API Payload: $data"
-        curl -sS -X "$method" \
+        local response
+        response=$(curl -sS -X "$method" \
              -H "Authorization: Token $API_TOKEN" \
              -H "Content-Type: application/json" \
              -H "Accept: application/json" \
              -d "$data" \
-             "$NETBOX_URL/api/$endpoint/"
+             "$trimmed_url/api/$endpoint/")
+        debug_print "API Response: $response"
+        echo "$response"
     else
-        curl -sS -X "$method" \
+        debug_print "API Request: $method $trimmed_url/api/$endpoint/"
+        local response
+        response=$(curl -sS -X "$method" \
              -H "Authorization: Token $API_TOKEN" \
+             -H "Content-Type: application/json" \
              -H "Accept: application/json" \
-             "$NETBOX_URL/api/$endpoint/"
+             "$trimmed_url/api/$endpoint/")
+        debug_print "API Response: $response"
+        echo "$response"
     fi
 }
 
@@ -334,15 +419,157 @@ check_device_exists() {
     echo "$response" | jq -r '.results[0].id // empty'
 }
 
-# Get ALL interfaces for device (workaround for API bug)
-get_all_interfaces_for_device() {
+# Get interface details for device
+get_interface_details() {
     local device_id="$1"
     local response
     response=$(api_request "GET" "dcim/interfaces" "?device_id=$device_id")
-    echo "$response" | jq -r '.results[].name'
+    echo "$response"
 }
 
-# Create interface (with MTU support)
+# Check if MAC address object already exists for this specific MAC
+check_mac_address_exists() {
+    local mac_address="$1"
+    local response
+    # Use 'mac_address' parameter, not 'address'
+    response=$(api_request "GET" "dcim/mac-addresses" "?mac_address=$mac_address")
+    
+    # Extract the ID if the MAC address object exists
+    local mac_id
+    mac_id=$(echo "$response" | jq -r '.results[0].id // empty')
+    
+    # Verify the MAC address in the response matches the requested one (defense against API quirks)
+    if [[ -n "$mac_id" ]]; then
+        local response_mac
+        response_mac=$(echo "$response" | jq -r ".results[0].mac_address // \"\"")
+        if [[ "${response_mac,,}" != "${mac_address,,}" ]]; then
+            debug_print "WARNING: API returned MAC address object ID $mac_id with MAC '$response_mac' instead of requested '$mac_address'. This indicates an API inconsistency. Treating as if MAC does not exist."
+            echo ""
+            return
+        fi
+    fi
+    
+    echo "$mac_id"
+}
+
+# Check if MAC address object is already assigned to the correct interface
+check_mac_assigned_to_interface() {
+    local mac_address="$1"
+    local interface_id="$2"
+    local response
+    # Query all MAC addresses assigned to the interface
+    response=$(api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id")
+    
+    # Check if any of the returned MAC addresses match the one we're looking for
+    local found_id
+    found_id=$(echo "$response" | jq -r --arg target_mac "$mac_address" '.results[] | select((.mac_address | ascii_downcase) == ($target_mac | ascii_downcase)) | .id // empty' | head -n1)
+    
+    echo "$found_id"
+}
+
+# Check if any MAC address object is assigned to the specified interface
+check_any_mac_assigned_to_interface() {
+    local interface_id="$1"
+    local response
+    response=$(api_request "GET" "dcim/mac-addresses" "?assigned_object_id=$interface_id")
+    local existing_mac_id
+    existing_mac_id=$(echo "$response" | jq -r '.results[0].id // empty')
+    echo "$existing_mac_id"
+}
+
+# Create MAC address object
+create_mac_address_object() {
+    local mac_address="$1"
+    local interface_id="$2"
+    
+    debug_print "Creating MAC address object for MAC: $mac_address, Interface ID: $interface_id"
+    
+    # Normalize MAC address for comparison (lowercase)
+    local normalized_mac="${mac_address,,}"
+    
+    # First check if MAC address is already assigned to the correct interface (double-check)
+    local assigned_to_interface_id
+    assigned_to_interface_id=$(check_mac_assigned_to_interface "$normalized_mac" "$interface_id")
+    
+    if [[ -n "$assigned_to_interface_id" ]]; then
+        debug_print "MAC address $normalized_mac is already correctly assigned to interface ID $interface_id"
+        echo "  MAC address $normalized_mac is already correctly assigned to interface ID $interface_id"
+        return 0 # Success, nothing to do
+    fi
+    
+    # Check if MAC address object already exists (but may be assigned to a different interface)
+    local existing_mac_id
+    existing_mac_id=$(check_mac_address_exists "$normalized_mac")
+    
+    if [[ -n "$existing_mac_id" ]]; then
+        debug_print "MAC address $normalized_mac already exists with ID $existing_mac_id, updating assignment to interface ID $interface_id"
+        # Update the existing MAC address to link to the correct interface
+        local update_payload="{\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
+        if [[ "$DRY_RUN" == false ]]; then
+            local update_response
+            update_response=$(api_request "PATCH" "dcim/mac-addresses/$existing_mac_id" "$update_payload")
+            if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
+                echo "  Updated MAC address object $existing_mac_id assignment for $normalized_mac to interface ID $interface_id"
+                return 0 # Success
+            else
+                echo "  Warning: Failed to update MAC address object $existing_mac_id assignment for $normalized_mac" >&2
+                debug_print "Response: $update_response"
+                return 1 # Failure
+            fi
+        else
+            echo "  MAC address object $existing_mac_id assignment for $normalized_mac would be updated to interface ID $interface_id"
+            return 0 # Success (dry-run)
+        fi
+    fi
+    
+    # Check if any MAC address object is already assigned to this interface and unassign it first
+    local existing_interface_mac_id
+    existing_interface_mac_id=$(check_any_mac_assigned_to_interface "$interface_id")
+    
+    if [[ -n "$existing_interface_mac_id" ]]; then
+        debug_print "Interface $interface_id already has a MAC address object (ID: $existing_interface_mac_id) assigned. Unassigning it first."
+        # Unassign the existing MAC address from the interface by setting assigned_object to null
+        local unassign_payload="{\"assigned_object_type\":null,\"assigned_object_id\":null}"
+        if [[ "$DRY_RUN" == false ]]; then
+            local unassign_response
+            unassign_response=$(api_request "PATCH" "dcim/mac-addresses/$existing_interface_mac_id" "$unassign_payload")
+            if echo "$unassign_response" | jq -e '.id' >/dev/null 2>&1; then
+                debug_print "Successfully unassigned MAC address object $existing_interface_mac_id from interface ID $interface_id"
+            else
+                echo "  Warning: Failed to unassign MAC address object $existing_interface_mac_id from interface ID $interface_id" >&2
+                debug_print "Response: $unassign_response"
+                # Continue anyway, as creating a new object might work
+            fi
+        else
+            echo "  MAC address object $existing_interface_mac_id would be unassigned from interface ID $interface_id"
+        fi
+    fi
+    
+    # Create new MAC address object - use 'mac_address' field
+    local mac_payload="{\"mac_address\":\"$normalized_mac\",\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        debug_print "Creating MAC address object with payload: $mac_payload"
+        local create_response
+        create_response=$(api_request "POST" "dcim/mac-addresses" "$mac_payload")
+        
+        if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
+            local new_mac_id
+            new_mac_id=$(echo "$create_response" | jq -r '.id')
+            echo "  Created MAC address object (ID: $new_mac_id) for $normalized_mac and assigned to interface ID $interface_id"
+            return 0 # Success
+        else
+            echo "  Warning: Failed to create MAC address object for $normalized_mac" >&2
+            debug_print "Response: $create_response"
+            return 1 # Failure
+        fi
+    else
+        echo "  MAC address object for $normalized_mac would be created and linked to interface ID $interface_id"
+        return 0 # Success (dry-run)
+    fi
+}
+
+# Create interface with proper hierarchy (parent, lag, bridge support)
 create_interface() {
     local device_id="$1"
     local interface_name="$2"
@@ -351,12 +578,20 @@ create_interface() {
     local speed="$5"
     local mtu="$6"
     
-    # Build interface payload with MTU
-    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\""
+    # Get master interface if it exists
+    local master_interface
+    master_interface=$(get_interface_master "$interface_name")
+    local parent_interface_id=""
     
-    if [[ -n "$mac_address" ]]; then
-        interface_payload="$interface_payload,\"mac_address\":\"$mac_address\""
+    if [[ -n "$master_interface" ]]; then
+        # Find the parent interface ID in NetBox
+        local parent_response
+        parent_response=$(api_request "GET" "dcim/interfaces" "?device_id=$device_id&name=$master_interface")
+        parent_interface_id=$(echo "$parent_response" | jq -r '.results[0].id // empty')
     fi
+    
+    # Build interface payload with hierarchy support
+    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\""
     
     if [[ -n "$speed" ]]; then
         interface_payload="$interface_payload,\"speed\":$speed"
@@ -366,19 +601,57 @@ create_interface() {
         interface_payload="$interface_payload,\"mtu\":$mtu"
     fi
     
+    if [[ -n "$parent_interface_id" ]]; then
+        # Add parent interface for proper hierarchy
+        interface_payload="$interface_payload,\"parent\":$parent_interface_id"
+    fi
+    
     interface_payload="$interface_payload}"
     
     if [[ "$DRY_RUN" == false ]]; then
         debug_print "Creating interface: $interface_payload"
         local create_response
         create_response=$(api_request "POST" "dcim/interfaces" "$interface_payload")
+        
         if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
+            local new_interface_id
+            new_interface_id=$(echo "$create_response" | jq -r '.id')
             echo "  Created interface: $interface_name"
+            
+            # Create MAC address object and link it to the interface if MAC is provided
+            if [[ -n "$mac_address" ]]; then
+                create_mac_address_object "$mac_address" "$new_interface_id"
+            fi
         else
             echo "  Warning: Failed to create interface $interface_name" >&2
+            debug_print "Full response: $create_response"
         fi
     else
-        echo "  Interface '$interface_name' would be created (type: $interface_type${mac_address:+, MAC: $mac_address}${speed:+, Speed: ${speed}Mbps}${mtu:+, MTU: $mtu})"
+        echo "  Interface '$interface_name' would be created (type: $interface_type${speed:+, Speed: ${speed}Mbps}${mtu:+, MTU: $mtu}${parent_interface_id:+, Parent: $parent_interface_id})"
+        if [[ -n "$mac_address" ]]; then
+            echo "  MAC address object for $mac_address would be created and linked to the interface"
+        fi
+    fi
+}
+
+# Update interface MAC address if needed (create MAC address object)
+update_interface_mac() {
+    local device_id="$1"
+    local interface_name="$2"
+    local mac_address="$3"
+    local interface_id="$4"
+    
+    if [[ -z "$mac_address" ]]; then
+        return 0 # Nothing to do, success
+    fi
+    
+    # Create MAC address object and link it to the interface
+    if [[ "$DRY_RUN" == false ]]; then
+        debug_print "Creating MAC address object for interface $interface_name (ID: $interface_id) with MAC: $mac_address"
+        create_mac_address_object "$mac_address" "$interface_id"
+        echo "  Updated interface '$interface_name' with MAC address: $mac_address"
+    else
+        echo "  Interface '$interface_name' would be updated with MAC address: $mac_address"
     fi
 }
 
@@ -455,33 +728,56 @@ else
     echo "Device created successfully!"
 fi
 
-# Detect and create network interfaces
+# Detect and create/update network interfaces
 echo "Detecting network interfaces..."
 INTERFACES=$(detect_network_interfaces)
 
 if [[ -n "$INTERFACES" ]]; then
-    echo "Found network interfaces, creating in Netbox..."
+    echo "Found network interfaces, checking in NetBox..."
     
-    # Get existing interfaces to avoid duplicates (workaround for API bug)
-    EXISTING_INTERFACES=$(get_all_interfaces_for_device "$DEVICE_ID")
-    debug_print "Existing interfaces: $(echo "$EXISTING_INTERFACES" | tr '\n' ' ')"
+    # Get existing interface details to map names to IDs
+    EXISTING_INTERFACE_DETAILS=$(get_interface_details "$DEVICE_ID")
     
+    # Process each detected interface
     while IFS= read -r interface; do
         if [[ -n "$interface" ]]; then
-            # Skip if interface already exists
-            if echo "$EXISTING_INTERFACES" | grep -Fxq "$interface"; then
-                debug_print "Interface '$interface' already exists, skipping..."
-                continue
-            fi
+            # Get interface details from NetBox
+            interface_id=$(echo "$EXISTING_INTERFACE_DETAILS" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')
             
+            # Get MAC address first
             MAC_ADDRESS=$(get_interface_mac "$interface")
             SPEED=$(get_interface_speed "$interface")
             MTU=$(get_interface_mtu "$interface")
             INTERFACE_TYPE=$(get_interface_type "$interface" "$SPEED")
-            create_interface "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU"
+            
+            # Normalize MAC address to lowercase for consistent handling
+            if [[ -n "$MAC_ADDRESS" ]]; then
+                MAC_ADDRESS=$(echo "$MAC_ADDRESS" | tr '[:upper:]' '[:lower:]')
+            fi
+            
+            # Check if this interface should have MAC address assigned
+            if should_assign_mac_address "$interface"; then
+                debug_print "Interface $interface should have MAC address assigned: $MAC_ADDRESS"
+                # MAC_ADDRESS is already set from get_interface_mac
+            else
+                debug_print "Interface $interface should not have MAC address assigned, clearing MAC"
+                MAC_ADDRESS=""  # Clear MAC address for interfaces that shouldn't have one
+            fi
+            
+            if [[ -n "$interface_id" ]]; then
+                # Interface exists, update MAC address if needed
+                if [[ -n "$MAC_ADDRESS" ]]; then
+                    update_interface_mac "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$interface_id"
+                else
+                    echo "  Skipped MAC address assignment for interface '$interface' (not assigned)"
+                fi
+            else
+                # Interface doesn't exist, create it with proper hierarchy
+                create_interface "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU"
+            fi
         fi
     done <<< "$INTERFACES"
-    echo "Network interface creation completed!"
+    echo "Network interface processing completed!"
 else
     echo "No network interfaces detected."
 fi
