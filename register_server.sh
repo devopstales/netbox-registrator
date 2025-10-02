@@ -979,6 +979,76 @@ create_ip_address() {
 }
 
 #######################################################################################
+# IPAM Detection
+#######################################################################################
+
+ipam_test() {
+    if ! command -v ipmitool >/dev/null 2>&1; then
+        debug_print "ipmitool not found, skipping IPMI detection."
+        return 1
+    else
+        return 0
+    fi
+}
+
+has_ipmi_interface() {
+    if ipam_test; then
+        if ! ipmitool mc info >/dev/null 2>&1; then
+            debug_print "IPMI interface not available or not accessible."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+create_ipmi_interface() {
+    local device_id="$1"
+
+    echo "Detecting IMPI interface..."
+    # Run ipmitool and capture output
+    local output
+    local ipmi_ip
+    local ipmi_mac
+
+    output=$(ipmitool lan print 1 2>/dev/null)
+    ipmi_ip=$(echo "$output" | awk -F': ' '/^IP Address[[:space:]]*:/ {print $2; exit}')
+    ipmi_mac=$(echo "$output" | awk -F': ' '/^MAC Address[[:space:]]*:/ {print $2; exit}')
+
+    # test console port on device
+    if has_ipmi_interface; then
+        # Display information
+        cat << EOF
+  Interface: IPAM
+  Type:      other
+  MAC:       $ipmi_mac
+  IPv4:      $ipmi_ip
+  -------------------------
+EOF
+
+        # Create missing console ports
+        create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" ""
+        echo "  IPMI interface created."
+
+        # Create Mac address
+        if [[ -n "$ipmi_mac" ]]; then
+            echo "  MAC Address found: $ipmi_mac"
+            create_or_update_mac_address_object "$ipmi_mac" "IPMI" "$device_id" "other"
+        else
+            echo "  No MAC Address detected for IPMI"
+        fi
+
+        # Create IP address
+        if [[ -n "$ipmi_ip" ]]; then
+            echo "  IPv4 Address found: $ipmi_ip"
+            create_ip_address "$ipmi_ip" "$(get_interface_details "$device_id" | jq -r --arg name "IPMI" '.results[] | select(.name == $name) | .id // empty')"
+        else
+            echo "  No IPv4 Address detected for IPMI"
+        fi
+
+    fi
+}
+
+#######################################################################################
 # Main execution
 #######################################################################################
 echo "Starting server registration in NetBox..."
@@ -1081,7 +1151,7 @@ if [[ -n "$INTERFACES" ]]; then
   IPv6:      $IPV6_ADDRESS
   -------------------------
 EOF
-
+        # Create or Update Interfaces
         create_or_update_interface "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU"
 
         # Check for missing objects
@@ -1113,6 +1183,9 @@ EOF
 else
     echo "No network interfaces detected."
 fi
+
+# Create Console Port
+create_ipmi_interface "$DEVICE_ID"
 
 echo ""
 echo "Server registration completed!"
