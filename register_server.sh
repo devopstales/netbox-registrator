@@ -8,22 +8,12 @@ set -euo pipefail
 # Configuration - Update these values for your environment
 NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL
 API_TOKEN="0123456789abcdef0123456789abcdef01234567" # Generate in Netbox: User -> API Tokens
-DEFAULT_SITE="office"                                # Must exist in Netbox
-DEFAULT_ROLE="server"                                # Must exist in Netbox
+DEFAULT_SITE_SLUG="office"                                # Must exist in Netbox (slug)
+DEFAULT_ROLE="Server"                                # Must exist in Netbox
 DEFAULT_STATUS="active"                              # Options: active, staged, failed, inventory, decommissioning
 DEFAULT_DEVICE_TYPE=""                               # Optional: specify default device type
 
 # Default values (can be overridden by command line)
-declare -a cpu_module_types=()
-declare -a cpu_module_bays=()
-declare -a cpu_modules=()
-declare -a memory_module_types=()   # For ModuleType creation
-declare -a memory_module_bays=()    # For ModuleBay creation  
-declare -a memory_modules=()        # For Module creation
-declare -a disk_module_types=()
-declare -a disk_module_bays=()
-declare -a disk_modules=()
-
 DEVICE_NAME=$(hostname -f)
 DEVICE_TYPE=""
 SERIAL=""
@@ -204,11 +194,17 @@ _check_device_exists() {
 # Create device payload helper
 _create_device_payload() {
     local is_update="$1"
+    local device_type_id="$2"
+    local site_id="$3"
+    local role_id="$4"
+    local comments_payload="$5"
+    local existing_device_id="$6"
+
     local json_data="{"
     json_data="${json_data}\"name\":\"$DEVICE_NAME\","
-    json_data="${json_data}\"device_type\":$DEVICE_TYPE_ID,"
-    json_data="${json_data}\"site\":$SITE_ID,"
-    json_data="${json_data}\"role\":$ROLE_ID,"
+    json_data="${json_data}\"device_type\":$device_type_id,"
+    json_data="${json_data}\"site\":$site_id,"
+    json_data="${json_data}\"role\":$role_id,"
     json_data="${json_data}\"status\":\"$DEFAULT_STATUS\","
 
     if [[ -n "$SERIAL" ]]; then
@@ -219,14 +215,61 @@ _create_device_payload() {
         json_data="${json_data}\"asset_tag\":\"$ASSET_TAG\","
     fi
 
-    json_data="${json_data}\"comments\":\"$COMMENTS_PAYLOAD\""
+    json_data="${json_data}\"comments\":\"$comments_payload\""
 
     if [[ "$is_update" == "true" ]]; then
-        json_data="${json_data},\"id\":$EXISTING_DEVICE_ID"
+        json_data="${json_data},\"id\":$existing_device_id"
     fi
 
     json_data="${json_data}}"
     echo "$json_data"
+}
+
+create_devices() {
+    # Auto-detect device type if enabled
+    if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
+        DEVICE_TYPE=$(_detect_device_type)
+        echo "Detected device type: $DEVICE_TYPE"
+        if [[ -z "$DEVICE_TYPE" ]]; then
+            echo "Error: Device type is required." >&2
+            exit 1
+        fi
+    fi
+
+    # Auto-detect serial if not provided
+    if [[ -z "$SERIAL" ]]; then
+        if SERIAL_DETECTED=$(_detect_serial 2>/dev/null); then
+            SERIAL="$SERIAL_DETECTED"
+            echo "Detected serial number: $SERIAL"
+        fi
+    fi
+
+    # Get required IDs
+    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG")
+    local role_id=$(_get_role_id "$DEFAULT_ROLE")
+    local device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
+
+    # Prepare comments
+    local comments_payload="${COMMENTS:-}"
+
+    # Check if device exists
+    local existing_device_id=$(_check_device_exists "$DEVICE_NAME")
+
+    # Register or update device
+    echo ""
+    if [[ -n "$existing_device_id" ]]; then
+        echo "Device '$DEVICE_NAME' already exists (ID: $existing_device_id). Updating..."
+        PAYLOAD=$(_create_device_payload "true" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "$existing_device_id")
+        RESPONSE=$(_api_request "PUT" "dcim/devices/$existing_device_id" "" "$PAYLOAD")
+        DEVICE_ID="$existing_device_id"
+        echo "Device updated successfully!"
+    else
+        echo "Creating new device '$DEVICE_NAME'..."
+        PAYLOAD=$(_create_device_payload "false" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "")
+        RESPONSE=$(_api_request "POST" "dcim/devices" "" "$PAYLOAD")
+        DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
+        echo "Device created successfully!"
+    fi
 }
 
 
@@ -284,7 +327,7 @@ _detect_serial() {
 _get_site_id() {
     local site_name="$1"
     local response
-    response=$(_api_request "GET" "dcim/sites" "?sluge=$site_name" "")
+    response=$(_api_request "GET" "dcim/sites" "?slug=$site_name" "")
     local site_id
     site_id=$(echo "$response" | jq -r '.results[0].id // empty')
     if [[ -z "$site_id" ]]; then
@@ -356,11 +399,83 @@ _detect_network_interfaces() {
 # Function to get interface speed
 _get_interface_speed() {
     local interface="$1"
+    local speed
+
+    # === Method 1: Use ethtool if available (preferred) ===
+    if command -v ethtool >/dev/null 2>&1; then
+        # Get full ethtool output once
+        local ethtool_out
+        ethtool_out=$(ethtool "$interface" 2>/dev/null)
+
+        # Try to extract current speed from "Speed:" line
+        speed=$(echo "$ethtool_out"| awk '
+    /Advertised link modes:/ {
+        # Extract everything after the colon
+        line = $0
+        sub(/.*Advertised link modes:[ \t]*/, "", line)
+        # Process this line for speeds
+        while (match(line, /([0-9]+)base/)) {
+            speed = substr(line, RSTART, RLENGTH - 4) + 0
+            if (speed > max) max = speed
+            line = substr(line, RSTART + RLENGTH - 4)
+        }
+    }
+    END { if (max > 0) print max }
+')
+
+        # If we got a valid positive number, return it
+        if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then
+            echo "$speed"
+            return 0
+        fi
+
+        # If speed is unknown or missing, fall back to "Advertised link modes"
+        # Parse the highest advertised speed (e.g., 1000, 10000)
+        speed=$(echo "$ethtool_out" | awk '
+            /^[\t ]*Advertised link modes:/ {
+                in_advertised = 1
+                sub(/.*Advertised link modes:[\t ]*/, "")
+            }
+            in_advertised && /^[ \t]*$/ { next }
+            in_advertised && /^[ \t]*[^ \t]/ {
+                if (!/Advertised link modes:/) in_advertised = 0
+            }
+            in_advertised {
+                for (i = 1; i <= NF; i++) {
+                    if (match($i, /^([0-9]+)base/)) {
+                        s = substr($i, RSTART, RLENGTH - 4) + 0
+                        if (s > max) max = s
+                    }
+                }
+            }
+            END { if (max > 0) print max }
+        ')
+
+        if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then
+            echo "$speed"
+            return 0
+        fi
+    fi
+
     if [[ -f "/sys/class/net/$interface/speed" ]]; then
         speed=$(cat "/sys/class/net/$interface/speed" 2>/dev/null)
         if [[ "$speed" != "-1" ]] && [[ "$speed" != "" ]] && [[ "$speed" =~ ^[0-9]+$ ]]; then
             echo "$speed"
+            return 0
         fi
+    fi
+}
+
+_get_interface_up_or_down() {
+    local iface="$1"
+    if ! ip link show "$iface" &>/dev/null; then
+        return 1  # interface doesn't exist
+    fi
+
+    if ip link show "$iface" 2>/dev/null | grep -q 'state UP'; then
+        echo "UP"
+    else
+        echo "DOWN"
     fi
 }
 
@@ -379,38 +494,73 @@ _get_interface_mtu() {
 _get_interface_type() {
     local interface="$1"
     local speed="$2"
-    
+
+    # Handle special interface names
     if [[ "$interface" == bond* ]]; then
         echo "lag"
         return
     fi
-    
+
     if [[ "$interface" == *"br"* ]] || [[ "$interface" == vmbr* ]]; then
         echo "bridge"
         return
     fi
-    
-    if [[ -n "$speed" ]]; then
-        if [[ "$speed" -eq 10 ]]; then
-            echo "10base-t"
-        elif [[ "$speed" -eq 100 ]]; then
-            echo "100base-tx"
-        elif [[ "$speed" -eq 1000 ]]; then
-            echo "1000base-t"
-        elif [[ "$speed" -eq 10000 ]]; then
-            echo "10gbase-t"
-        elif [[ "$speed" -eq 25000 ]]; then
-            echo "25gbase-x-sfp28"
-        elif [[ "$speed" -eq 40000 ]]; then
-            echo "40gbase-x-qsfpp"
-        elif [[ "$speed" -eq 100000 ]]; then
-            echo "100gbase-x-qsfp28"
-        else
-            echo "other"
+
+    # === Detect SFP / SFP+ via ethtool --module-info ===
+    if command -v ethtool >/dev/null 2>&1; then
+        local module_info
+        module_info=$(ethtool --module-info "$interface" 2>/dev/null)
+
+        if [[ -n "$module_info" ]]; then
+            local identifier
+            identifier=$(echo "$module_info" | awk '/Identifier[ \t]*:/ {print $3}')
+
+            case "$identifier" in
+                "0x03")  # SFP
+                    echo "1000base-x-sfp"
+                    return
+                    ;;
+                "0x0d")  # SFP+
+                    if [[ -n "$speed" ]]; then
+                        case "$speed" in
+                            1000)   echo "1000base-x-sfp" ;;
+                            10000)  echo "10gbase-x-sfp+" ;;
+                            25000)  echo "25gbase-x-sfp28" ;;  # some SFP28
+                            *)      echo "10gbase-x-sfp+" ;;
+                        esac
+                    else
+                        echo "10gbase-x-sfp+"
+                    fi
+                    return
+                    ;;
+                "0x11")  # QSFP+
+                    echo "40gbase-x-qsfpp"
+                    return
+                    ;;
+                "0x12")  # QSFP28
+                    echo "100gbase-x-qsfp28"
+                    return
+                    ;;
+            esac
         fi
+    fi
+
+    # === Fallback: Guess from speed (assumes copper unless SFP detected) ===
+    if [[ -n "$speed" ]]; then
+        case "$speed" in
+            10)     echo "10base-t" ;;
+            100)    echo "100base-tx" ;;
+            1000)   echo "1000base-t" ;;
+            10000)  echo "10gbase-t" ;;
+            25000)  echo "25gbase-x-sfp28" ;;
+            40000)  echo "40gbase-x-qsfpp" ;;
+            100000) echo "100gbase-x-qsfp28" ;;
+            *)      echo "other" ;;
+        esac
         return
     fi
 
+    # === Final fallback: interface name heuristics ===
     if [[ "$interface" == eth* ]] || [[ "$interface" == en* ]] || [[ "$interface" == em* ]]; then
         echo "1000base-t"
     elif [[ "$interface" == wlan* ]] || [[ "$interface" == wlp* ]] || [[ "$interface" == wifi* ]]; then
@@ -621,13 +771,14 @@ _get_interface_details() {
     echo "$response"
 }
 
-create_or_update_interface() {
+_create_or_update_interface() {
     local device_id="$1"
     local interface_name="$2"
     local mac_address="$3"
     local interface_type="$4"
     local speed="$5"
     local mtu="$6"
+    local active="$7"
     local parent_interface_id=""
 
     # Get existing interface details
@@ -646,7 +797,17 @@ create_or_update_interface() {
     fi
 
     # Build interface payload with hierarchy support
-    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\""
+    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\"" # $active
+
+    # Normalize active state to uppercase (if needed)
+    local active_upper=$(echo "$active" | tr '[:lower:]' '[:upper:]')
+
+    if [[ "$active_upper" == "UP" ]]; then
+        interface_payload="$interface_payload,\"enabled\":true"
+    else
+        interface_payload="$interface_payload,\"enabled\":false"
+    fi
+
     if [[ -n "$speed" ]]; then
         interface_payload="$interface_payload,\"speed\":$speed"
     fi
@@ -695,6 +856,101 @@ create_or_update_interface() {
             fi
         fi
     fi
+}
+
+detect_and_create_network_interfaces() {
+    # Detect and create network interfaces
+    echo ""
+    echo "Detecting network interfaces..."
+
+    local device_id="$1"
+    INTERFACES=$(_detect_network_interfaces)
+
+    if [[ -n "$INTERFACES" ]]; then
+        echo "Found network interfaces, creating in NetBox..."
+
+        # Convert interface list to JSON array for cleanup function
+        interface_array_json="["
+        first_interface=true
+        while IFS= read -r interface; do
+        if [[ -n "$interface" ]]; then
+            if [[ "$first_interface" == true ]]; then
+            interface_array_json="${interface_array_json}\"$interface\""
+            first_interface=false
+            else
+            interface_array_json="${interface_array_json},\"$interface\""
+            fi
+        fi
+        done <<< "$INTERFACES"
+        interface_array_json="${interface_array_json}]"
+        
+        # Clean up ALL MAC addresses for the device before reassigning them
+        #_cleanup_all_device_mac_addresses "$device_id"
+
+        # Process each interface
+        while IFS= read -r interface; do
+        if [[ -n "$interface" ]]; then
+            echo ""
+            echo "Processing interface: $interface"
+
+            # Gather interface properties with error handling
+            MASTER=$(_get_interface_master "$interface") || MASTER=""
+            SPEED=$(_get_interface_speed "$interface") || SPEED=""
+            ACTIVE=$(_get_interface_up_or_down "$interface") || ACTIVE="DOWN"
+            INTERFACE_TYPE=$(_get_interface_type "$interface" "$SPEED") || INTERFACE_TYPE="other"
+            MTU=$(_get_interface_mtu "$interface") || MTU=""
+            MAC_ADDRESS=$(_get_interface_mac "$interface") || MAC_ADDRESS=""
+            IPV4_ADDRESS=$(_get_ipv4 "$interface") || IPV4_ADDRESS=""
+            IPV6_ADDRESS=$(_get_ipv6 "$interface") || IPV6_ADDRESS=""
+
+            # Display information
+            cat << EOF
+    Interface: $interface
+    Active:    $ACTIVE
+    Type:      $INTERFACE_TYPE
+    Master:    $MASTER
+    Speed:     $SPEED
+    MTU:       $MTU
+    MAC:       $MAC_ADDRESS
+    IPv4:      $IPV4_ADDRESS
+    IPv6:      $IPV6_ADDRESS
+    -------------------------
+EOF
+            # Create or Update Interfaces
+            _create_or_update_interface "$device_id" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU" "$ACTIVE"
+
+            # Check for missing objects
+            if [[ -n "$MAC_ADDRESS" ]]; then
+                echo "  MAC Address found: $MAC_ADDRESS"
+                create_or_update_mac_address_object "$MAC_ADDRESS" "$interface" "$device_id" "$INTERFACE_TYPE"
+            else
+                echo "  No MAC Address detected for $interface"
+            fi
+
+            if [[ -n "$IPV4_ADDRESS" ]]; then
+                echo "  IPv4 Address found: $IPV4_ADDRESS"
+                create_ip_address "$IPV4_ADDRESS" "$(_get_interface_details "$device_id" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
+            else
+                echo "  No IPv4 Address detected for $interface"
+            fi
+
+            if [[ -n "$IPV6_ADDRESS" ]]; then
+                echo "  IPv6 Address found: $IPV6_ADDRESS"
+                create_ip_address "$IPV6_ADDRESS" "$(_get_interface_details "$device_id" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
+            else
+                echo "  No IPv6 Address detected for $interface"
+            fi
+
+            echo "  -------------------------"
+
+        fi
+        done <<< "$INTERFACES"
+    else
+        echo "No network interfaces detected."
+    fi
+
+    # Create Console Port
+    create_ipmi_interface "$device_id"
 }
 
 #######################################################################################
@@ -964,69 +1220,141 @@ create_or_update_mac_address_object() {
 }
 
 #######################################################################################
-# IPMI
+# IP Adress
 #######################################################################################
 
 # Function to create IP address in NetBox
 create_ip_address() {
-    local ip_address="$1"
+    local ip_with_prefix="$1"
     local interface_id="$2"
-    
-    # Check if IP address already exists
+
+    # Validate input
+    if [[ -z "$ip_with_prefix" ]] || [[ -z "$interface_id" ]]; then
+        echo "  Error: Missing IP or interface ID for IP assignment" >&2
+        return 1
+    fi
+
+    # Check if CIDR is present
+    if [[ "$ip_with_prefix" != */* ]]; then
+        echo "  Warning: No CIDR in IP '$ip_with_prefix'. Skipping prefix association."
+        local prefix_id=""
+        local full_prefix=""
+    else
+        # Use Python to compute network address and validate
+        if command -v python3 >/dev/null 2>&1; then
+            local full_prefix
+            full_prefix=$(python3 -c "
+import ipaddress
+try:
+    net = ipaddress.ip_network('$ip_with_prefix', strict=False)
+    print(net)
+except Exception as e:
+    exit(1)
+" 2>/dev/null)
+
+            if [[ -n "$full_prefix" ]]; then
+                # URL-encode the prefix for GET request
+                local encoded_prefix
+                encoded_prefix=$(printf '%s' "$full_prefix" | jq -sRr 'split("\n") | .[0] | @uri')
+
+                # Check if prefix exists
+                local prefix_resp
+                prefix_resp=$(_api_request "GET" "ipam/prefixes" "?prefix=$encoded_prefix" "")
+                local prefix_count
+                prefix_count=$(echo "$prefix_resp" | jq -r '.count // 0')
+
+                if [[ "$prefix_count" -eq 0 ]]; then
+                    # Create prefix
+                    local prefix_payload="{\"prefix\":\"$full_prefix\",\"status\":\"active\"}"
+                    if [[ "$DRY_RUN" == true ]]; then
+                        echo "  Prefix '$full_prefix' would be created"
+                        prefix_id="DRY_RUN_ID"
+                    else
+                        _debug_print "Creating prefix: $full_prefix"
+                        local create_resp
+                        create_resp=$(_api_request "POST" "ipam/prefixes" "" "$prefix_payload")
+                        prefix_id=$(echo "$create_resp" | jq -r '.id // empty')
+                        if [[ -n "$prefix_id" ]]; then
+                            echo "  Created prefix: $full_prefix (ID: $prefix_id)"
+                        else
+                            echo "  Warning: Failed to create prefix '$full_prefix'" >&2
+                            _debug_print "Response: $create_resp"
+                            prefix_id=""
+                        fi
+                    fi
+                else
+                    prefix_id=$(echo "$prefix_resp" | jq -r '.results[0].id // empty')
+                    _debug_print "Prefix '$full_prefix' already exists (ID: $prefix_id)"
+                fi
+            else
+                echo "  Warning: Could not compute network prefix for '$ip_with_prefix'" >&2
+                prefix_id=""
+                full_prefix=""
+            fi
+        else
+            echo "  Warning: python3 not found. Skipping prefix creation." >&2
+            prefix_id=""
+            full_prefix=""
+        fi
+    fi
+
+    # Handle the IP address itself
     local existing_ip_id
-    existing_ip_id=$(_api_request "GET" "ipam/ip-addresses" "?address=$ip_address" "" | jq -r '.results[0].id // empty')
-    
+    existing_ip_id=$(_api_request "GET" "ipam/ip-addresses" "?address=$ip_with_prefix" "" | jq -r '.results[0].id // empty')
+
+    # Build IP payload
+    local ip_payload="{\"address\":\"$ip_with_prefix\""
+    if [[ -n "$prefix_id" ]] && [[ "$prefix_id" != "DRY_RUN_ID" ]]; then
+        ip_payload="$ip_payload,\"prefix\":$prefix_id"
+    fi
+    ip_payload="$ip_payload,\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id,\"status\":\"active\"}"
+
     if [[ -n "$existing_ip_id" ]]; then
-        echo "  IP address $ip_address already exists (ID: $existing_ip_id)"
-        # Check if it's assigned to the correct interface
+        echo "  IP address $ip_with_prefix already exists (ID: $existing_ip_id)"
+        # Check current assignment
         local current_assignment
         current_assignment=$(_api_request "GET" "ipam/ip-addresses/$existing_ip_id" "" "" | jq -r '.assigned_object_id // empty')
         if [[ "$current_assignment" != "$interface_id" ]]; then
             if [[ "$DRY_RUN" == true ]]; then
-                echo "  IP address $ip_address would be reassigned from interface $current_assignment to $interface_id"
+                echo "  IP would be reassigned to interface ID $interface_id"
             else
                 local update_payload="{\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
                 local update_response
                 update_response=$(_api_request "PATCH" "ipam/ip-addresses/$existing_ip_id" "" "$update_payload")
                 if echo "$update_response" | jq -e '.id' >/dev/null 2>&1; then
-                    echo "  Reassigned IP address $ip_address to interface ID $interface_id"
+                    echo "  Reassigned IP $ip_with_prefix to interface ID $interface_id"
                 else
-                    echo "  Warning: Failed to reassign IP address $ip_address" >&2
+                    echo "  Warning: Failed to reassign IP $ip_with_prefix" >&2
+                    _debug_print "Response: $update_response"
                 fi
             fi
         fi
         return 0
     fi
-    
-    # Create IP address object
-    local ip_payload="{\"address\":\"$ip_address\",\"assigned_object_type\":\"dcim.interface\",\"assigned_object_id\":$interface_id}"
-    
+
+    # Create new IP
     if [[ "$DRY_RUN" == true ]]; then
-        echo "  IP address $ip_address would be created and assigned to interface ID $interface_id"
-        return 0
+        echo "  IP address $ip_with_prefix would be created (prefix: ${full_prefix:-none})"
     else
-        _debug_print "Creating IP address with payload: $ip_payload"
+        _debug_print "Creating IP with payload: $ip_payload"
         local create_response
         create_response=$(_api_request "POST" "ipam/ip-addresses" "" "$ip_payload")
-        
         if echo "$create_response" | jq -e '.id' >/dev/null 2>&1; then
             local new_ip_id
             new_ip_id=$(echo "$create_response" | jq -r '.id')
-            echo "  Created IP address (ID: $new_ip_id) for $ip_address and assigned to interface ID $interface_id"
-            return 0
+            echo "  Created IP address (ID: $new_ip_id): $ip_with_prefix"
         else
-            echo "  Warning: Failed to create IP address for $ip_address" >&2
+            echo "  Warning: Failed to create IP address for $ip_with_prefix" >&2
             _debug_print "Response: $create_response"
-            return 1
         fi
     fi
 }
 
 #######################################################################################
-# IPAM Detection
+# IPMI Detection
 #######################################################################################
 
-_ipam_test() {
+_ipmitool_test() {
     if ! command -v ipmitool >/dev/null 2>&1; then
         _debug_print "ipmitool not found, skipping IPMI detection."
         return 1
@@ -1036,7 +1364,7 @@ _ipam_test() {
 }
 
 _has_ipmi_interface() {
-    if _ipam_test; then
+    if _ipmitool_test; then
         if ! ipmitool mc info >/dev/null 2>&1; then
             _debug_print "IPMI interface not available or not accessible."
             return 1
@@ -1071,7 +1399,7 @@ create_ipmi_interface() {
 EOF
 
         # Create missing console ports
-        create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" ""
+        _create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" "" ""
         echo ""
         echo "  IPMI interface created."
 
@@ -1095,8 +1423,126 @@ EOF
 }
 
 #######################################################################################
+# Neighbors
+#######################################################################################
+
+# Inside the loop in _get_lldp_neighbors(), after extracting data:
+_create_lldp_cable_in_netbox() {
+    local local_interface_name="$1"
+    local remote_device_name="$2"
+    local remote_interface_name="$3"
+    local device_id="$4"
+
+    # Get local interface ID
+    local local_iface_id
+    local_iface_id=$(_get_interface_details "$device_id" | jq -r --arg name "$local_interface_name" '.results[] | select(.name == $name) | .id // empty')
+    if [[ -z "$local_iface_id" ]]; then
+        _debug_print "Local interface $local_interface_name not found in NetBox"
+        return 1
+    fi
+
+    # Get remote device ID
+    local remote_device_id
+    remote_device_id=$(_api_request "GET" "dcim/devices" "?name=$remote_device_name" "" | jq -r '.results[0].id // empty')
+    if [[ -z "$remote_device_id" ]]; then
+        _debug_print "Remote device $remote_device_name not found in NetBox"
+        return 1
+    fi
+
+    # Get remote interface ID
+    local remote_iface_id
+    remote_iface_id=$(_get_interface_details "$remote_device_id" | jq -r --arg name "$remote_interface_name" '.results[] | select(.name == $name) | .id // empty')
+    if [[ -z "$remote_iface_id" ]]; then
+        _debug_print "Remote interface $remote_interface_name not found on device $remote_device_name"
+        return 1
+    fi
+
+    # Check if cable already exists
+    local existing_cable
+    existing_cable=$(_api_request "GET" "dcim/cables" "?connected_endpoint_a_type=dcim.interface&connected_endpoint_a_id=$local_iface_id" "")
+    if [[ "$(echo "$existing_cable" | jq -r '.count // 0')" -gt 0 ]]; then
+        echo "  Cable already exists for $local_interface_name"
+        return 0
+    fi
+
+    # Create cable
+    if [[ "$DRY_RUN" == false ]]; then
+        local cable_payload="{\"termination_a_type\":\"dcim.interface\",\"termination_a_id\":$local_iface_id,\"termination_b_type\":\"dcim.interface\",\"termination_b_id\":$remote_iface_id}"
+        _api_request "POST" "dcim/cables" "" "$cable_payload" >/dev/null
+        echo "  Created cable: $local_interface_name ↔ $remote_device_name:$remote_interface_name"
+    else
+        echo "  Cable would be created: $local_interface_name ↔ $remote_device_name:$remote_interface_name"
+    fi
+}
+
+get_lldp_neighbors() {
+    local device_id="$1"  # NetBox device ID (optional for now)
+
+    echo ""
+    echo "Detected LLDP neighbors:"
+
+    if ! command -v lldpcli >/dev/null 2>&1; then
+        echo "  Warning: lldpcli not found. Skipping LLDP neighbor discovery." >&2
+        return 1
+    fi
+
+    local lldp_output
+    lldp_output=$(lldpcli show neighbors details -f json 2>/dev/null)
+
+    if [[ -z "$lldp_output" ]] || [[ "$lldp_output" == *"No such file or directory"* ]]; then
+        echo "  No LLDP neighbors detected."
+        return 0
+    fi
+
+    # Iterate over each element in the "interface" array
+    local interface_count
+    interface_count=$(echo "$lldp_output" | jq -r '.lldp.interface | length // 0')
+
+    if [[ "$interface_count" -eq 0 ]]; then
+        echo "    (none)"
+        return 0
+    fi
+
+    for ((i = 0; i < interface_count; i++)); do
+        # Extract interface name (the key inside the object at index i)
+        local iface_obj
+        iface_obj=$(echo "$lldp_output" | jq -r ".lldp.interface[$i]")
+
+        # Get the interface name (e.g., "eno1")
+        local interface_name
+        interface_name=$(echo "$iface_obj" | jq -r 'keys[0]')
+
+        if [[ -z "$interface_name" ]] || [[ "$interface_name" == "null" ]]; then
+            continue
+        fi
+
+        # Extract data under that interface
+        local chassis_name chassis_id port_id port_desc system_desc
+        chassis_name=$(echo "$iface_obj" | jq -r ".\"$interface_name\".chassis | keys[0] // empty")
+        chassis_id=$(echo "$iface_obj" | jq -r ".\"$interface_name\".chassis.\"$chassis_name\".id.value // empty")
+        port_id=$(echo "$iface_obj" | jq -r ".\"$interface_name\".port.id.value // empty")
+        port_desc=$(echo "$iface_obj" | jq -r ".\"$interface_name\".port.descr // empty")
+        system_desc=$(echo "$iface_obj" | jq -r ".\"$interface_name\".chassis.\"$chassis_name\".descr // empty")
+
+        cat << EOF
+    Interface: $interface_name
+      Chassis:     $chassis_name
+      Port:        $port_id
+      Port desc:   $port_desc
+      MAC Address: $chassis_id
+      System:      $system_desc
+
+EOF
+    done
+}
+
+#######################################################################################
 # CPU
 #######################################################################################
+
+declare -a cpu_module_types=()
+declare -a cpu_module_bays=()
+declare -a cpu_modules=()
 
 _gather_cpu_for_netbox() {
     local device_id="$1"
@@ -1185,9 +1631,14 @@ _process_cpu_device() {
     module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
     module_type_json+="\"model\":\"$cpu_model\","
     module_type_json+="\"part_number\":\"$cpu_model\","
+
+    module_type_json+="\"attributes\":{"
     module_type_json+="\"cores\":$core_count,"
+    module_type_json+="\"speed\":$clock_speed"
+    # Architecture ???
+    module_type_json+="},"
+
     module_type_json+="\"threads\":$thread_count,"
-    module_type_json+="\"clock_speed\":$clock_speed,"
     module_type_json+="\"socket\":\"$socket\""
     module_type_json+="}"
     cpu_module_types+=("$module_type_json")
@@ -1290,10 +1741,10 @@ _create_cpu_module_in_netbox() {
                     # Fix payload to use bay ID instead of name
                     local fixed_mod_json
                     fixed_mod_json=$(echo "$mod_json" | jq --arg id "$bay_id" '.module_bay = ($id | tonumber)' 2>/dev/null || echo "$mod_json")
-                    echo "Creating CPU Module in bay: $mod_bay_name"
+                    echo "  Creating CPU Module in bay: $mod_bay_name"
                     _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
                 else
-                    echo "CPU Module already exists in bay: $mod_bay_name"
+                    echo "  CPU Module already exists in bay: $mod_bay_name"
                 fi
             else
                 _debug_print "ERROR: No CPU ModuleBay ID found for: $mod_bay_name"
@@ -1307,6 +1758,10 @@ _create_cpu_module_in_netbox() {
 #######################################################################################
 # Memory
 #######################################################################################
+
+declare -a memory_module_types=()   # For ModuleType creation
+declare -a memory_module_bays=()    # For ModuleBay creation  
+declare -a memory_modules=()        # For Module creation
 
 _gather_memory_for_netbox() {
     local device_id="$1"  # NetBox device ID or name
@@ -1413,10 +1868,14 @@ _process_memory_device() {
     module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
     module_type_json+="\"model\":\"$part_number\","
     module_type_json+="\"part_number\":\"$part_number\","
-    module_type_json+="\"size\":$size_gb,"
+
+    module_type_json+="\"attributes\":{"
     module_type_json+="\"class\":\"$mem_class\","
+    module_type_json+="\"size\":$size_gb,"
     module_type_json+="\"data_rate\":$speed_mts,"
     module_type_json+="\"ecc\":$ecc"
+    module_type_json+="}"
+
     module_type_json+="}"
     memory_module_types+=("$module_type_json")
 
@@ -1493,7 +1952,7 @@ _create_memory_module_in_netbox() {
                     _debug_print "ERROR: Failed to get ID for new ModuleBay: $bay_name"
                 fi
             else
-                echo "ModuleBay already exists: $bay_name"
+                echo "  ModuleBay already exists: $bay_name"
                 local bay_id
                 bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
                 if [[ -n "$bay_id" ]]; then
@@ -1538,6 +1997,10 @@ _create_memory_module_in_netbox() {
 # Disks
 #######################################################################################
 
+declare -a disk_module_types=()
+declare -a disk_module_bays=()
+declare -a disk_modules=()
+
 _gather_disks_for_netbox() {
     local device_id="$1"
     disk_module_types=()
@@ -1551,9 +2014,9 @@ _gather_disks_for_netbox() {
         return 1
     fi
 
-    # Get list of physical disks
+    # Get list of physical disk devices (type=disk only)
     local disks
-    disks=$(lsblk -d -n -o NAME 2>/dev/null | grep -E '^[a-z]+[0-9]*$')
+    disks=$(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2 == "disk" {print $1}' | grep -E '^[a-z]+[0-9]*$')
     _debug_print "Found disk devices: $(echo "$disks" | tr '\n' ' ')"
 
     if [[ -z "$disks" ]]; then
@@ -1567,78 +2030,76 @@ _gather_disks_for_netbox() {
         ((disk_count++))
         _debug_print "Processing disk: /dev/$name"
 
-        # Get SMART info - your controller works with direct access!
+        # Get SMART info
         local smart_info
         smart_info=$(smartctl -i "/dev/$name" 2>/dev/null)
-        
-        if [[ -z "$smart_info" ]] || [[ "$smart_info" == *"Read Device Identity failed"* ]]; then
-            _debug_print "ERROR: smartctl failed for /dev/$name"
+
+        if [[ -z "$smart_info" ]] || [[ "$smart_info" == *"Read Device Identity failed"* ]] || [[ "$smart_info" == *"INQUIRY failed"* ]]; then
+            _debug_print "WARNING: smartctl failed for /dev/$name – skipping"
             continue
         fi
 
-        _debug_print "SMART data length: $(echo "$smart_info" | wc -c) bytes"
-
-        # Extract fields from SMART data - USE EXACT FIELD NAMES FROM YOUR OUTPUT
-        local model serial interface rpm size_gb
-
-        # Model - EXACT field name from your output: "Device Model:"
-        model=$(echo "$smart_info" | grep "^Device Model:" | sed 's/Device Model:[[:space:]]*//')
-        _debug_print "Extracted model: '$model'"
+        # --- Extract model ---
+        local model
+        model=$(echo "$smart_info" | grep -E '^(Device Model|Model Number):' | sed -E 's/^(Device Model|Model Number):[[:space:]]*//')
         [[ -z "$model" ]] && model="Unknown"
-
-        # Serial - EXACT field name: "Serial Number:"
-        serial=$(echo "$smart_info" | grep "^Serial Number:" | sed 's/Serial Number:[[:space:]]*//')
-        _debug_print "Extracted serial: '$serial'"
-
-        # Interface - your drives show "SATA Version is:" but they're SAS drives
-        # Since you have LSI MegaRAID, assume SAS for enterprise drives
-        interface="SAS"
-        if [[ "$model" == *"SSD"* ]] || [[ "$model" == *"EVO"* ]]; then
-            interface="SATA"
-        fi
-        _debug_print "Detected interface: '$interface'"
-
-        # RPM - EXACT field name: "Rotation Rate:"
-        rpm=0
-        local rotation_line
-        rotation_line=$(echo "$smart_info" | grep "^Rotation Rate:")
-        if [[ -n "$rotation_line" ]]; then
-            if [[ "$rotation_line" == *"solid state"* ]]; then
-                rpm=0
-            else
-                rpm=$(echo "$rotation_line" | grep -o '[0-9]*' | head -1)
-            fi
-        elif [[ "$model" == *"SSD"* ]] || [[ "$model" == *"EVO"* ]]; then
-            rpm=0
-        else
-            rpm=7200  # Default for your enterprise drives
-        fi
-        _debug_print "Final RPM: $rpm"
-
-        # Size in GB (from lsblk) - fix the command and whitespace
-        size_gb=0
-        local size_str
-        size_str=$(lsblk -d -n -o SIZE "/dev/$name" 2>/dev/null | tr -d ' ')
-        _debug_print "Raw size from lsblk: '$size_str'"
-        if [[ -n "$size_str" ]] && [[ "$size_str" =~ ^([0-9.]+)([KMGT])$ ]]; then
-            local num="${BASH_REMATCH[1]}"
-            local unit="${BASH_REMATCH[2]}"
-            case "$unit" in
-                K) size_gb=$(echo "scale=0; $num / 1024 / 1024" | bc -l 2>/dev/null || echo "0") ;;
-                M) size_gb=$(echo "scale=0; $num / 1024" | bc -l 2>/dev/null || echo "0") ;;
-                G) size_gb=$(echo "scale=0; $num" | bc -l 2>/dev/null || echo "0") ;;
-                T) size_gb=$(echo "scale=0; $num * 1024" | bc -l 2>/dev/null || echo "0") ;;
-            esac
-        fi
-        size_gb=${size_gb:-0}  # Ensure it's always a number
-        _debug_print "Final size in GB: $size_gb"
+        model="${model//\"/\\\"}"
 
         if [[ "$model" == "Unknown" ]]; then
             _debug_print "Skipping disk with unknown model"
             continue
         fi
 
-        _debug_print "Successfully processed disk: $name -> $model ($size_gb GB, $interface, $rpm RPM)"
+        # --- Extract serial ---
+        local serial
+        serial=$(echo "$smart_info" | grep "^Serial Number:" | sed 's/Serial Number:[[:space:]]*//')
+        serial="${serial//\"/\\\"}"
+
+        # --- Determine interface ---
+        local interface="SAS"
+        if [[ "$model" == *"SSD"* ]] || [[ "$model" == *"EVO"* ]] || [[ "$model" == *"NVMe"* ]] || [[ "$smart_info" == *"SATA"* ]]; then
+            interface="SATA"
+        fi
+
+        # --- Determine RPM ---
+        local rpm=7200
+        if [[ "$model" == *"SSD"* ]] || [[ "$model" == *"NVMe"* ]]; then
+            rpm=0
+        else
+            local rotation_line
+            rotation_line=$(echo "$smart_info" | grep "^Rotation Rate:")
+            if [[ -n "$rotation_line" ]]; then
+                if [[ "$rotation_line" == *"solid state device"* ]] || [[ "$rotation_line" == *"Not reported"* ]]; then
+                    rpm=0
+                else
+                    rpm=$(echo "$rotation_line" | grep -o '[0-9]\+' | head -1)
+                    rpm=${rpm:-7200}
+                fi
+            fi
+        fi
+
+        # --- Get size in GB as INTEGER (using --bytes to avoid decimals) ---
+        local size_gb=0
+        local size_bytes
+        size_bytes=$(lsblk -d -n -o SIZE --bytes "/dev/$name" 2>/dev/null | tr -d '[:space:]')
+        _debug_print "Raw size in bytes: '$size_bytes'"
+
+        if [[ -n "$size_bytes" ]] && [[ "$size_bytes" =~ ^[0-9]+$ ]] && (( size_bytes > 0 )); then
+            # 1 GB = 1,000,000,000 bytes (decimal)
+            size_gb=$(( (size_bytes + 999999999) / 1000000000 ))
+        fi
+
+        # Ensure non-negative integer
+        size_gb=$(( size_gb < 0 ? 0 : size_gb ))
+
+        # If device exists but size is 0, set to 1 GB minimum
+        if [[ "$size_gb" -eq 0 ]] && [[ -n "$size_bytes" ]] && (( size_bytes > 0 )); then
+            size_gb=1
+        fi
+
+        _debug_print "Final disk info: model='$model', size=$size_gb GB, interface=$interface, rpm=$rpm"
+
+        # Process the disk
         _process_disk_device "$device_id" "$name" "$model" "$size_gb" "$interface" "$serial" "$rpm" ""
     done <<< "$disks"
 
@@ -1697,13 +2158,13 @@ _process_disk_device() {
     _ensure_manufacturer "$manufacturer"
 
     # Map interface to profile "type" field
-    local disk_type="HDD"
+    local disk_type="HD"
     if [[ $rpm -eq 0 ]]; then
         disk_type="SSD"
     elif [[ "$interface" == "NVME" ]]; then
         disk_type="NVME"
     else
-        disk_type="HDD"
+        disk_type="HD"
     fi
 
     # Escape strings for JSON (but don't trim model/serial!)
@@ -1722,9 +2183,13 @@ _process_disk_device() {
     module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
     module_type_json+="\"model\":\"$model\","
     module_type_json+="\"part_number\":\"$model\","
+
+    module_type_json+="\"attributes\":{"
     module_type_json+="\"size\":$size_gb,"          # ← matches profile field "size"
-    module_type_json+="\"speed\":$rpm,"            # ← matches profile field "speed"  
+    module_type_json+="\"speed\":$rpm,"            # ← matches profile field "speed"
     module_type_json+="\"type\":\"$disk_type\""    # ← matches profile field "type"
+    module_type_json+="}"
+
     module_type_json+="}"
     disk_module_types+=("$module_type_json")
 
@@ -1840,6 +2305,591 @@ _create_disk_module_in_netbox() {
 }
 
 #######################################################################################
+## Controllers
+#######################################################################################
+
+# Global arrays for controllers
+declare -a controller_module_types=()
+declare -a controller_module_bays=()
+declare -a controller_modules=()
+
+_gather_controllers_for_netbox() {
+    local device_id="$1"
+    controller_module_types=()
+    controller_module_bays=()
+    controller_modules=()
+
+    echo "Detecting Controllers..."
+
+    # Try lshw first (best structured output)
+    if command -v lshw &> /dev/null; then
+        _debug_print "Using lshw"
+        _detect_controllers_with_lshw "$device_id"
+    # Fall back to lspci if lshw not available
+    elif command -v lspci &> /dev/null; then
+        _debug_print "Using lspci"
+        _detect_controllers_with_lspci "$device_id"
+    else
+        echo "Error: No controller detection tools available (lshw or lspci)" >&2
+        return 1
+    fi
+}
+
+_detect_controllers_with_lshw() {
+    local device_id="$1"
+    
+    local lshw_output
+    lshw_output=$(sudo lshw -c storage 2>/dev/null)
+    
+    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+        _debug_print "No controller info from lshw"
+        return
+    fi
+
+    # Process output line by line without aggressive trimming
+    local section=""
+    local product=""
+    local vendor=""
+    local bus_info=""
+    
+    while IFS= read -r line; do
+        # Remove trailing carriage returns (Windows line endings)
+        line="${line%$'\r'}"
+        
+        # Skip empty lines
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        # Check for section start (*-raid, *-sas, *-sata)
+        if [[ "$line" =~ ^[[:space:]]*\*- ]]; then
+            # End previous section if we have complete data
+            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+                local ctrl_type="Controller"
+                if [[ "$section" == "*-raid" ]]; then
+                    ctrl_type="RAID"
+                elif [[ "$section" == "*-sas" ]]; then
+                    ctrl_type="SAS"
+                elif [[ "$section" == "*-sata" ]]; then
+                    ctrl_type="SATA"
+                fi
+                
+                # Get firmware for RAID controllers
+                local firmware=""
+                if [[ "$ctrl_type" == "RAID" ]] && command -v megacli &> /dev/null; then
+                    firmware=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                fi
+                
+                _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
+            fi
+            
+            # Start new section
+            section="$line"
+            product=""
+            vendor=""
+            bus_info=""
+            continue
+        fi
+        
+        # Only process lines that are indented (child elements)
+        if [[ "$line" == *" "* ]] && [[ "$line" != "$section" ]]; then
+            # Extract field values (everything after first colon)
+            if [[ "$line" == *"product:"* ]]; then
+                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"vendor:"* ]]; then
+                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"bus info:"* ]]; then
+                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            fi
+        fi
+    done <<< "$lshw_output"
+    
+    # Handle the last controller
+    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+        local ctrl_type="Controller"
+        if [[ "$section" == "*-raid" ]]; then
+            ctrl_type="RAID"
+        elif [[ "$section" == "*-sas" ]]; then
+            ctrl_type="SAS"
+        elif [[ "$section" == "*-sata" ]]; then
+            ctrl_type="SATA"
+        fi
+        
+        local firmware=""
+        if [[ "$ctrl_type" == "RAID" ]] && command -v megacli &> /dev/null; then
+            firmware=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        fi
+        
+        _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
+    fi
+}
+
+_detect_controllers_with_lspci() {
+    local device_id="$1"
+    
+    local controllers
+    controllers=$(lspci -vvv | grep -A20 -E "RAID bus controller|Serial Attached SCSI controller")
+
+    if [[ -z "$controllers" ]]; then
+        _debug_print "No controllers found with lspci"
+        return
+    fi
+
+    local pci_address model
+    while IFS= read -r line; do
+        if [[ "$line" == *"RAID bus controller"* ]] || [[ "$line" == *"Serial Attached SCSI controller"* ]]; then
+            pci_address=$(echo "$line" | cut -d' ' -f1)
+            model=$(echo "$line" | sed 's/^[^:]*: //' | _trim)
+            
+            # Determine manufacturer from model
+            local manufacturer="Unknown"
+            if [[ "$model" == *"Broadcom"* ]] || [[ "$model" == *"LSI"* ]]; then
+                manufacturer="Broadcom"
+            elif [[ "$model" == *"Intel"* ]]; then
+                manufacturer="Intel"
+            elif [[ "$model" == *"Marvell"* ]]; then
+                manufacturer="Marvell"
+            elif [[ "$model" == *"AMD"* ]] || [[ "$model" == *"ATI"* ]]; then
+                manufacturer="AMD"
+            fi
+            
+            # Determine controller type
+            local ctrl_type="Controller"
+            if [[ "$line" == *"RAID bus controller"* ]]; then
+                ctrl_type="RAID"
+            elif [[ "$line" == *"Serial Attached SCSI controller"* ]]; then
+                ctrl_type="SAS"
+            fi
+            
+            # Get firmware version (if available)
+            local firmware_version=""
+            if [[ "$manufacturer" == "Broadcom" ]]; then
+                if command -v megacli &> /dev/null; then
+                    firmware_version=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | _trim)
+                fi
+            fi
+            
+            _process_controller_device "$device_id" "$pci_address" "$model" "$manufacturer" "$ctrl_type" "$firmware_version"
+        fi
+    done <<< "$controllers"
+}
+
+_process_controller_device() {
+    local device_id="$1" pci_address="$2" model="$3" manufacturer="$4" ctrl_type="$5" firmware="$6"
+
+    # Clean up manufacturer name
+    case "$manufacturer" in
+        *"Broadcom"*|*"LSI"*) manufacturer="Broadcom" ;;
+        *"Intel"*) manufacturer="Intel" ;;
+        *"Marvell"*) manufacturer="Marvell" ;;
+        *"AMD"*|*"ATI"*) manufacturer="AMD" ;;
+        *) manufacturer="Unknown" ;;
+    esac
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Clean and truncate model name for NetBox limits
+    local clean_model="$model"
+    local truncated_model="${clean_model:0:100}"
+    local truncated_part_number="${clean_model:0:50}"
+
+    # Escape strings for JSON
+    pci_address="${pci_address//\"/\\\"}"
+    truncated_model="${truncated_model//\"/\\\"}"
+    truncated_part_number="${truncated_part_number//\"/\\\"}"
+    manufacturer="${manufacturer//\"/\\\"}"
+    ctrl_type="${ctrl_type//\"/\\\"}"
+    firmware="${firmware//\"/\\\"}"
+
+    # Set default values
+    local ports=8
+    local interface_speed="12Gbps"
+    if [[ "$ctrl_type" == "NVMe" ]]; then
+        interface_speed="PCIe"
+    fi
+
+    # 1. MODULE TYPE (controller template) - Profile ID 7
+    local module_type_json="{"
+    module_type_json+="\"profile\":7,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$truncated_model\","
+    module_type_json+="\"part_number\":\"$truncated_part_number\","
+    module_type_json+="\"controller_type\":\"$ctrl_type\","
+    module_type_json+="\"firmware_version\":\"$firmware\","
+    module_type_json+="\"ports\":$ports,"
+    module_type_json+="\"interface_speed\":\"$interface_speed\""
+    module_type_json+="}"
+    controller_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (PCIe slot)
+    local bay_name="PCIe-$pci_address"
+    local bay_json="{\"device\":$device_id,\"name\":\"$bay_name\",\"description\":\"Controller Slot $pci_address\",\"label\":\"Controller\"}"
+    controller_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed controller instance)
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$bay_name\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$truncated_model\"}}"
+    controller_modules+=("$module_json")
+}
+
+_create_controller_module_in_netbox() {
+    local device_id="$1"
+    echo "Detecting Controller Items..."
+    _gather_controllers_for_netbox "$device_id" || return 1
+
+    echo "Creating controller modules in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (deduplicated)
+    declare -A controller_module_type_map
+    for mt_json in "${controller_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        if [[ -z "$manuf" ]] || [[ -z "$model" ]]; then
+            _debug_print "Skipping empty Controller ModuleType"
+            continue
+        fi
+        
+        local key="${manuf}_${model}"
+        if [[ -z "${controller_module_type_map[$key]:-}" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating Controller ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "Controller ModuleType already exists: $manuf / $model"
+            fi
+            controller_module_type_map["$key"]=1
+        fi
+    done
+
+    # 2. Create ModuleBays AND store IDs
+    declare -A controller_module_bay_id_map
+    for bay_json in "${controller_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local encoded_bay_name
+            encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "Creating Controller ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id
+                bay_id=$(echo "$bay_resp" | jq -r '.id // empty' 2>/dev/null)
+                if [[ -n "$bay_id" ]]; then
+                    controller_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created Controller ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new Controller ModuleBay: $bay_name"
+                fi
+            else
+                echo "Controller ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    controller_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing Controller ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing Controller ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules using ModuleBay IDs
+    for mod_json in "${controller_modules[@]}"; do
+        local mod_bay_name
+        mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]]; then
+            if [[ -n "${controller_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+                local bay_id="${controller_module_bay_id_map[$mod_bay_name]}"
+                local mod_exists
+                mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+                local mod_count
+                mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+                
+                if [[ "$mod_count" -eq 0 ]]; then
+                    local manuf=$(echo "$mod_json" | jq -r '.module_type.manufacturer.name // empty')
+                    local model=$(echo "$mod_json" | jq -r '.module_type.model // empty')
+                    local fixed_mod_json="{\"device\":$device_id,\"module_bay\":$bay_id,\"module_type\":{\"manufacturer\":{\"name\":\"$manuf\"},\"model\":\"$model\"}}"
+                    echo "Creating Controller Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
+                else
+                    echo "Controller Module already exists in bay: $mod_bay_name"
+                fi
+            else
+                _debug_print "ERROR: No Controller ModuleBay ID found for: $mod_bay_name"
+            fi
+        fi
+    done
+
+    echo "Controller module sync completed."
+}
+
+#######################################################################################
+# GPU
+#######################################################################################
+
+# Global arrays for GPU
+declare -a gpu_module_types=()
+declare -a gpu_module_bays=()
+declare -a gpu_modules=()
+
+_gather_gpus_for_netbox() {
+    local device_id="$1"
+    gpu_module_types=()
+    gpu_module_bays=()
+    gpu_modules=()
+
+    echo "Detecting GPUs..."
+
+    # Try lshw first (best structured output)
+    if command -v lshw &> /dev/null; then
+        _debug_print "Using lshw"
+        _detect_gpus_with_lshw "$device_id"
+    # Fall back to lspci if lshw not available
+    elif command -v lspci &> /dev/null; then
+        _debug_print "Using lspci"
+        _detect_gpus_with_lspci "$device_id"
+    else
+        echo "Error: No GPU detection tools available (lshw or lspci)" >&2
+        return 1
+    fi
+}
+
+_detect_gpus_with_lshw() {
+    local device_id="$1"
+    
+    local lshw_output
+    lshw_output=$(sudo lshw -c display 2>/dev/null)
+    
+    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+        _debug_print "No GPU info from lshw"
+        return
+    fi
+
+    local section=""
+    local product=""
+    local vendor=""
+    local bus_info=""
+    
+    while IFS= read -r line; do
+        line="${line%$'\r'}"  # Remove Windows line endings
+        
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        # Match GPU sections: *-display
+        if [[ "$line" =~ ^[[:space:]]*\*-display ]]; then
+            # Process previous GPU if complete
+            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+                _process_gpu_device "$device_id" "$pci_address" "$product" "$vendor" "0"
+            fi
+            
+            # Reset for new GPU
+            section="$line"
+            product=""
+            vendor=""
+            bus_info=""
+            continue
+        fi
+        
+        # Only process indented child lines
+        if [[ "$line" == *" "* ]] && [[ "$line" != "$section" ]]; then
+            if [[ "$line" == *"product:"* ]]; then
+                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"vendor:"* ]]; then
+                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"bus info:"* ]]; then
+                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            fi
+        fi
+    done <<< "$lshw_output"
+    
+    # Handle last GPU
+    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+        _process_gpu_device "$device_id" "$pci_address" "$product" "$vendor" "0"
+    fi
+}
+
+_process_gpu_device() {
+    local device_id="$1" pci_address="$2" model="$3" manufacturer="$4" memory_size="$5"
+
+    # Clean up manufacturer name
+    case "$manufacturer" in
+        *"Matrox"*) manufacturer="Matrox" ;;
+        *"NVIDIA"*) manufacturer="NVIDIA" ;;
+        *"AMD"*|*"ATI"*|*"Advanced Micro"*) manufacturer="AMD" ;;
+        *"Intel"*) manufacturer="Intel" ;;
+        *"ASPEED"*) manufacturer="ASPEED" ;;
+        *) manufacturer="Unknown" ;;
+    esac
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Clean and truncate model name for NetBox limits
+    local clean_model="$model"
+    local truncated_model="${clean_model:0:100}"
+    local truncated_part_number="${clean_model:0:50}"
+
+    # Escape strings for JSON
+    pci_address="${pci_address//\"/\\\"}"
+    truncated_model="${truncated_model//\"/\\\"}"
+    truncated_part_number="${truncated_part_number//\"/\\\"}"
+    manufacturer="${manufacturer//\"/\\\"}"
+
+    # Determine GPU type
+    local gpu_type="Discrete"
+    if [[ "$manufacturer" == "Intel" ]] || [[ "$manufacturer" == "ASPEED" ]]; then
+        gpu_type="Integrated"
+    fi
+
+    # 1. MODULE TYPE (GPU template) - Profile ID 3
+    local module_type_json="{"
+    module_type_json+="\"profile\":3,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$truncated_model\","
+    module_type_json+="\"part_number\":\"$truncated_part_number\","
+
+    module_type_json+="\"attributes\":{"
+    module_type_json+="\"memory\":$memory_size,"
+    module_type_json+="\"gpu\":\"$gpu_type\""
+    module_type_json+="}"
+
+    module_type_json+="}"
+    gpu_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (PCIe slot)
+    local bay_name="PCIe-$pci_address"
+    local bay_json="{\"device\":$device_id,\"name\":\"$bay_name\",\"description\":\"GPU Slot $pci_address\",\"label\":\"GPU\"}"
+    gpu_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed GPU instance)
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$bay_name\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$truncated_model\"}}"
+    gpu_modules+=("$module_json")
+}
+
+_create_gpu_module_in_netbox() {
+    local device_id="$1"
+    echo "Detecting GPU Items..."
+    _gather_gpus_for_netbox "$device_id" || return 1
+
+    echo "Creating GPU modules in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (deduplicated)
+    declare -A gpu_module_type_map
+    for mt_json in "${gpu_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        if [[ -z "$manuf" ]] || [[ -z "$model" ]]; then
+            _debug_print "Skipping empty GPU ModuleType"
+            continue
+        fi
+        
+        local key="${manuf}_${model}"
+        if [[ -z "${gpu_module_type_map[$key]:-}" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating GPU ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "GPU ModuleType already exists: $manuf / $model"
+            fi
+            gpu_module_type_map["$key"]=1
+        fi
+    done
+
+    # 2. Create ModuleBays AND store IDs
+    declare -A gpu_module_bay_id_map
+    for bay_json in "${gpu_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local encoded_bay_name
+            encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "Creating GPU ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id
+                bay_id=$(echo "$bay_resp" | jq -r '.id // empty' 2>/dev/null)
+                if [[ -n "$bay_id" ]]; then
+                    gpu_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created GPU ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new GPU ModuleBay: $bay_name"
+                fi
+            else
+                echo "GPU ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    gpu_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing GPU ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing GPU ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules using ModuleBay IDs
+    for mod_json in "${gpu_modules[@]}"; do
+        local mod_bay_name
+        mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]]; then
+            if [[ -n "${gpu_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+                local bay_id="${gpu_module_bay_id_map[$mod_bay_name]}"
+                local mod_exists
+                mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+                local mod_count
+                mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+                
+                if [[ "$mod_count" -eq 0 ]]; then
+                    local manuf=$(echo "$mod_json" | jq -r '.module_type.manufacturer.name // empty')
+                    local model=$(echo "$mod_json" | jq -r '.module_type.model // empty')
+                    local fixed_mod_json="{\"device\":$device_id,\"module_bay\":$bay_id,\"module_type\":{\"manufacturer\":{\"name\":\"$manuf\"},\"model\":\"$model\"}}"
+                    echo "Creating GPU Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
+                else
+                    echo "GPU Module already exists in bay: $mod_bay_name"
+                fi
+            else
+                _debug_print "ERROR: No GPU ModuleBay ID found for: $mod_bay_name"
+            fi
+        fi
+    done
+
+    echo "GPU module sync completed."
+}
+
+#######################################################################################
 # Netbox Modules
 #######################################################################################
 # Module pyte custom atributes
@@ -1848,153 +2898,115 @@ _create_disk_module_in_netbox() {
 ## RAM
 # data_rate, size
 
+_ensure_module_type_profiles() {
+    echo "Ensuring required ModuleType Profiles exist..."
+
+    # Define required profiles
+    declare -A required_profiles=(
+        ["Memory"]="{
+            \"name\": \"Memory\",
+            \"description\": \"RAM modules\",
+            \"schema\": {
+                \"properties\": {
+                    \"size\": {\"type\": \"integer\", \"description\": \"Capacity in GB\"},
+                    \"class\": {\"type\": \"string\", \"enum\": [\"DDR3\", \"DDR4\", \"DDR5\"]},
+                    \"data_rate\": {\"type\": \"integer\", \"description\": \"Speed in MT/s\"},
+                    \"ecc\": {\"type\": \"boolean\", \"description\": \"Error-correcting code enabled\"}
+                },
+                \"required\": [\"size\", \"class\"]
+            }
+        }"
+        ["CPU"]="{
+            \"name\": \"CPU\",
+            \"description\": \"Processor modules\",
+            \"schema\": {
+                \"properties\": {
+                    \"cores\": {\"type\": \"integer\"},
+                    \"threads\": {\"type\": \"integer\"},
+                    \"clock_speed\": {\"type\": \"number\", \"description\": \"Clock speed in GHz\"},
+                    \"socket\": {\"type\": \"string\"}
+                },
+                \"required\": [\"cores\", \"socket\"]
+            }
+        }"
+        ["Hard disk"]="{
+            \"name\": \"Hard disk\",
+            \"description\": \"Storage devices\",
+            \"schema\": {
+                \"properties\": {
+                    \"size\": {\"type\": \"integer\", \"description\": \"Raw disk capacity in GB\"},
+                    \"speed\": {\"type\": \"integer\", \"description\": \"Speed in RPM (0 for SSD)\"},
+                    \"type\": {\"type\": \"string\", \"enum\": [\"HD\", \"SSD\", \"NVME\"]}
+                },
+                \"required\": [\"size\"]
+            }
+        }"
+        ["Controller"]="{
+            \"name\": \"Controller\",
+            \"description\": \"SAS/RAID/HBA controllers\",
+            \"schema\": {
+                \"properties\": {
+                    \"controller_type\": {\"type\": \"string\", \"enum\": [\"SAS\", \"RAID\", \"HBA\", \"NVMe\"]},
+                    \"firmware_version\": {\"type\": \"string\"},
+                    \"ports\": {\"type\": \"integer\"},
+                    \"interface_speed\": {\"type\": \"string\"}
+                },
+                \"required\": [\"controller_type\"]
+            }
+        }"
+    )
+
+    # Check and create each profile
+    for profile_name in "${!required_profiles[@]}"; do
+        local profile_data="${required_profiles[$profile_name]}"
+        _debug_print "Checking profile: $profile_name"
+
+        # URL encode profile name for API query
+        local encoded_name
+        encoded_name=$(printf '%s' "$profile_name" | jq -sRr 'split("\n") | .[0] | @uri')
+        
+        # Check if profile exists
+        local exists_resp
+        exists_resp=$(_api_request "GET" "dcim/module-type-profiles" "?name=$encoded_name" "")
+        local count
+        count=$(echo "$exists_resp" | jq -r '.count // 0')
+
+        if [[ "$count" -eq 0 ]]; then
+            _debug_print "Creating ModuleType Profile: $profile_name"
+            _api_request "POST" "dcim/module-type-profiles" "" "$profile_data" >/dev/null
+        else
+            _debug_print "ModuleType Profile already exists: $profile_name"
+        fi
+    done
+
+    echo "ModuleType Profile check completed."
+}
+
 create_modules() {
     local device_id="$1"
 
     echo ""
+    _ensure_module_type_profiles
+
     _create_cpu_module_in_netbox "$device_id"
     _create_memory_module_in_netbox "$device_id"
     _create_disk_module_in_netbox "$device_id"
+    _create_controller_module_in_netbox "$device_id"
+    _create_gpu_module_in_netbox "$device_id"
 }
 
 #######################################################################################
 # Main execution
 #######################################################################################
 echo "Starting server registration in NetBox..."
+# Create Device
+create_devices
 
-# Auto-detect device type if enabled
-if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
-    DEVICE_TYPE=$(_detect_device_type)
-    echo "Detected device type: $DEVICE_TYPE"
-    if [[ -z "$DEVICE_TYPE" ]]; then
-        echo "Error: Device type is required." >&2
-        exit 1
-    fi
-fi
+# Create Network Interface MAC and IP
+#detect_and_create_network_interfaces "$DEVICE_ID"
 
-# Auto-detect serial if not provided
-if [[ -z "$SERIAL" ]]; then
-    if SERIAL_DETECTED=$(_detect_serial 2>/dev/null); then
-        SERIAL="$SERIAL_DETECTED"
-        echo "Detected serial number: $SERIAL"
-    fi
-fi
-
-# Get required IDs
-SITE_ID=$(_get_site_id "$DEFAULT_SITE")
-ROLE_ID=$(_get_role_id "$DEFAULT_ROLE")
-DEVICE_TYPE_ID=$(_get_device_type_id "$DEVICE_TYPE")
-
-# Prepare comments
-COMMENTS_PAYLOAD="${COMMENTS:-}"
-
-# Check if device exists
-EXISTING_DEVICE_ID=$(_check_device_exists "$DEVICE_NAME")
-
-# Register or update device
-echo ""
-if [[ -n "$EXISTING_DEVICE_ID" ]]; then
-    echo "Device '$DEVICE_NAME' already exists (ID: $EXISTING_DEVICE_ID). Updating..."
-    PAYLOAD=$(_create_device_payload "true")
-    RESPONSE=$(_api_request "PUT" "dcim/devices/$EXISTING_DEVICE_ID" "" "$PAYLOAD")
-    DEVICE_ID="$EXISTING_DEVICE_ID"
-    echo "Device updated successfully!"
-else
-    echo "Creating new device '$DEVICE_NAME'..."
-    PAYLOAD=$(_create_device_payload "false")
-    RESPONSE=$(_api_request "POST" "dcim/devices" "" "$PAYLOAD")
-    DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
-    echo "Device created successfully!"
-fi
-echo ""
-
-# Detect and create network interfaces
-echo "Detecting network interfaces..."
-INTERFACES=$(_detect_network_interfaces)
-
-if [[ -n "$INTERFACES" ]]; then
-    echo "Found network interfaces, creating in NetBox..."
-
-    # Convert interface list to JSON array for cleanup function
-    interface_array_json="["
-    first_interface=true
-    while IFS= read -r interface; do
-      if [[ -n "$interface" ]]; then
-        if [[ "$first_interface" == true ]]; then
-          interface_array_json="${interface_array_json}\"$interface\""
-          first_interface=false
-        else
-          interface_array_json="${interface_array_json},\"$interface\""
-        fi
-      fi
-    done <<< "$INTERFACES"
-    interface_array_json="${interface_array_json}]"
-    
-    # Clean up ALL MAC addresses for the device before reassigning them
-    #_cleanup_all_device_mac_addresses "$DEVICE_ID"
-
-    # Process each interface
-    while IFS= read -r interface; do
-      if [[ -n "$interface" ]]; then
-        echo ""
-        echo "Processing interface: $interface"
-
-        # Gather interface properties with error handling
-        MASTER=$(_get_interface_master "$interface") || MASTER=""
-        SPEED=$(_get_interface_speed "$interface") || SPEED=""
-        INTERFACE_TYPE=$(_get_interface_type "$interface" "$SPEED") || INTERFACE_TYPE="other"
-        MTU=$(_get_interface_mtu "$interface") || MTU=""
-        MAC_ADDRESS=$(_get_interface_mac "$interface") || MAC_ADDRESS=""
-        IPV4_ADDRESS=$(_get_ipv4 "$interface") || IPV4_ADDRESS=""
-        IPV6_ADDRESS=$(_get_ipv6 "$interface") || IPV6_ADDRESS=""
-
-        # Display information
-        cat << EOF
-  Interface: $interface
-  Type:      $INTERFACE_TYPE
-  Master:    $MASTER
-  Speed:     $SPEED
-  MTU:       $MTU
-  MAC:       $MAC_ADDRESS
-  IPv4:      $IPV4_ADDRESS
-  IPv6:      $IPV6_ADDRESS
-  -------------------------
-EOF
-        # Create or Update Interfaces
-        create_or_update_interface "$DEVICE_ID" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU"
-
-        # Check for missing objects
-        if [[ -n "$MAC_ADDRESS" ]]; then
-            echo "  MAC Address found: $MAC_ADDRESS"
-            create_or_update_mac_address_object "$MAC_ADDRESS" "$interface" "$DEVICE_ID" "$INTERFACE_TYPE"
-        else
-            echo "  No MAC Address detected for $interface"
-        fi
-
-        if [[ -n "$IPV4_ADDRESS" ]]; then
-            echo "  IPv4 Address found: $IPV4_ADDRESS"
-            create_ip_address "$IPV4_ADDRESS" "$(_get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
-        else
-            echo "  No IPv4 Address detected for $interface"
-        fi
-
-        if [[ -n "$IPV6_ADDRESS" ]]; then
-            echo "  IPv6 Address found: $IPV6_ADDRESS"
-            create_ip_address "$IPV6_ADDRESS" "$(_get_interface_details "$DEVICE_ID" | jq -r --arg name "$interface" '.results[] | select(.name == $name) | .id // empty')"
-        else
-            echo "  No IPv6 Address detected for $interface"
-        fi
-
-        echo "  -------------------------"
-
-      fi
-    done <<< "$INTERFACES"
-else
-    echo "No network interfaces detected."
-fi
-
-# Create Console Port
-create_ipmi_interface "$DEVICE_ID"
+# Get LLDP neighbors in JSON format
+#get_lldp_neighbors "$DEVICE_ID"
 
 # Create module items
 create_modules "$DEVICE_ID"

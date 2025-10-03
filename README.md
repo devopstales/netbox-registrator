@@ -8,21 +8,20 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 
 * Create servers through standard tools (`dmidecode`)
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
-* Create IPMI interface if found
+  * Create IPMI interface if found
 * Update existing `Device` and `Interface`
-* Local inventory using `Modules` for CPU, RAM, physical disks
+* Local inventory using `Modules` for CPU, GPU, RAM, physical disks, Raid Controller, SAS Controller
 
 # Missing Features
 
 * Read Configs from config file or wnviroment variable
 * Generic ability to guess datacenters and rack location (Configure in config file)
+* Create or get existing VLAN and associate it to interfaces
 * Detect if server is a VM
   * Associate hypervisor devices to the virtualization cluster
   * Associate virtual machines to the hypervisor device
 * Create chassis and blade through standard tools (`dmidecode`)
   * Handle blade moving (new slot, new chassis)
-* Local inventory using `Modules` for GPU, Raid Controller, SAS Controller
-  * Correctly set RAM and physical disk sizes (BUG)
 * Update existing `Device` and `Interface`
   * Handle changes in physical disk, RAM
 * PSUs creation and power consumption reporting (based on vendor's tools)
@@ -31,8 +30,9 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 # Requirements
 
 - Netbox >= 3.7
+
 - ip
-- ethtool
+- ethtoop
 - dmidecode
 - ipmitool
 - lldpd
