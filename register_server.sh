@@ -408,48 +408,31 @@ _get_interface_speed() {
         ethtool_out=$(ethtool "$interface" 2>/dev/null)
 
         # Try to extract current speed from "Speed:" line
-        speed=$(echo "$ethtool_out"| awk '
-    /Advertised link modes:/ {
-        # Extract everything after the colon
-        line = $0
-        sub(/.*Advertised link modes:[ \t]*/, "", line)
-        # Process this line for speeds
-        while (match(line, /([0-9]+)base/)) {
-            speed = substr(line, RSTART, RLENGTH - 4) + 0
-            if (speed > max) max = speed
-            line = substr(line, RSTART + RLENGTH - 4)
-        }
-    }
-    END { if (max > 0) print max }
-')
+        if [[ "$ethtool_out" =~ Speed:\ ([0-9]+)Mb/s ]]; then
+            local speed_val="${BASH_REMATCH[1]}"
+            if [[ -n "$speed_val" ]] && [[ "$speed_val" =~ ^[0-9]+$ ]]; then
+                echo "$speed_val"
+                return 0
+            fi
+        fi
 
-        # If we got a valid positive number, return it
-        if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then
+        # === Method 2 (last resort): Parse highest advertised speed from ethtool ===
+        local speed=0
+        while read -r line; do
+            # Match patterns like "1000baseT/Full"
+            while [[ "$line" =~ ([0-9]+)base ]]; do
+                local s="${BASH_REMATCH[1]}"
+                if (( s > speed )); then
+                    speed="$s"
+                fi
+                # Remove matched part to continue
+                line="${line#*${BASH_REMATCH[0]}}"
+            done
+        done <<< "$ethtool_out"
+        if (( speed > 0 )); then
             echo "$speed"
             return 0
         fi
-
-        # If speed is unknown or missing, fall back to "Advertised link modes"
-        # Parse the highest advertised speed (e.g., 1000, 10000)
-        speed=$(echo "$ethtool_out" | awk '
-            /^[\t ]*Advertised link modes:/ {
-                in_advertised = 1
-                sub(/.*Advertised link modes:[\t ]*/, "")
-            }
-            in_advertised && /^[ \t]*$/ { next }
-            in_advertised && /^[ \t]*[^ \t]/ {
-                if (!/Advertised link modes:/) in_advertised = 0
-            }
-            in_advertised {
-                for (i = 1; i <= NF; i++) {
-                    if (match($i, /^([0-9]+)base/)) {
-                        s = substr($i, RSTART, RLENGTH - 4) + 0
-                        if (s > max) max = s
-                    }
-                }
-            }
-            END { if (max > 0) print max }
-        ')
 
         if [[ -n "$speed" && "$speed" =~ ^[0-9]+$ && "$speed" -gt 0 ]]; then
             echo "$speed"
@@ -457,6 +440,7 @@ _get_interface_speed() {
         fi
     fi
 
+    # === Method 2: Use /sys/class/net/$interface/speed (returns Mbps) ===
     if [[ -f "/sys/class/net/$interface/speed" ]]; then
         speed=$(cat "/sys/class/net/$interface/speed" 2>/dev/null)
         if [[ "$speed" != "-1" ]] && [[ "$speed" != "" ]] && [[ "$speed" =~ ^[0-9]+$ ]]; then
@@ -548,7 +532,7 @@ _get_interface_type() {
     # === Fallback: Guess from speed (assumes copper unless SFP detected) ===
     if [[ -n "$speed" ]]; then
         case "$speed" in
-            10)     echo "10base-t" ;;
+            10)     echo "other" ;;
             100)    echo "100base-tx" ;;
             1000)   echo "1000base-t" ;;
             10000)  echo "10gbase-t" ;;
@@ -764,6 +748,25 @@ _get_ipv6() {
 # Interface
 #######################################################################################
 
+declare -A nic_module_id_by_mac=()
+
+_get_interface_pci_address() {
+    local iface="$1"
+    _debug_print "_get_interface_pci_address: $iface"
+
+    # sysfs symlink (works for onboard NICs)
+    local sys_link
+    sys_link=$(readlink "/sys/class/net/$iface/device" 2>/dev/null)
+    _debug_print "_get_interface_pci_address: $sys_link"
+    if [[ "$sys_link" =~ ../../../([0-9a-f]{4}:([0-9a-f]{2}:[0-9a-f]{2}\.[0-9])) ]]; then
+        echo "${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    _debug_print "PCI Address Not found"
+    return 1
+}
+
 _get_interface_details() {
     local device_id="$1"
     local response
@@ -780,6 +783,7 @@ _create_or_update_interface() {
     local mtu="$6"
     local active="$7"
     local parent_interface_id=""
+    local module_id="${8:-}"  # Optional module ID
 
     # Get existing interface details
     local existing_interface_info
@@ -797,7 +801,11 @@ _create_or_update_interface() {
     fi
 
     # Build interface payload with hierarchy support
-    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\"" # $active
+    local interface_payload="{\"device\":$device_id,\"name\":\"$interface_name\",\"type\":\"$interface_type\""
+
+    if [[ -n "$module_id" ]]; then
+        interface_payload="$interface_payload,\"module\":$module_id"
+    fi
 
     # Normalize active state to uppercase (if needed)
     local active_upper=$(echo "$active" | tr '[:lower:]' '[:upper:]')
@@ -875,10 +883,10 @@ detect_and_create_network_interfaces() {
         while IFS= read -r interface; do
         if [[ -n "$interface" ]]; then
             if [[ "$first_interface" == true ]]; then
-            interface_array_json="${interface_array_json}\"$interface\""
-            first_interface=false
+                interface_array_json="${interface_array_json}\"$interface\""
+                first_interface=false
             else
-            interface_array_json="${interface_array_json},\"$interface\""
+                interface_array_json="${interface_array_json},\"$interface\""
             fi
         fi
         done <<< "$INTERFACES"
@@ -903,6 +911,37 @@ detect_and_create_network_interfaces() {
             IPV4_ADDRESS=$(_get_ipv4 "$interface") || IPV4_ADDRESS=""
             IPV6_ADDRESS=$(_get_ipv6 "$interface") || IPV6_ADDRESS=""
 
+            # Determine MODULE_ID_FOR_INTERFACE using PCI address
+            local MODULE_ID_FOR_INTERFACE=""
+            local pci_addr bay_name encoded_bay_name bay_exists bay_count bay_id
+            if [[ "$INTERFACE_TYPE" != "bridge" ]] && [[ "$INTERFACE_TYPE" != "lag" ]] && [[ "$interface" != vmbr* ]] && [[ "$interface" != bond* ]]; then
+                pci_addr=$(_get_interface_pci_address "$interface")
+                _debug_print "PCI_ADDR: $pci_addr"
+
+                if [[ -n "$pci_addr" ]]; then
+                    echo "Gether Module: on PCI address $pci_addr for $interface"
+                    bay_name="PCIe-$pci_addr"
+                    encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+                    bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+                    bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+                    if [[ "$bay_count" -gt 0 ]]; then
+                        bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                        if [[ -n "$bay_id" ]]; then
+                            MODULE_ID_FOR_INTERFACE=$bay_id
+                            echo "Found NIC module ID $MODULE_ID_FOR_INTERFACE in bay $bay_name (PCI: $pci_addr) for interface $interface"
+                        else
+                            echo "No module found in bay $bay_name (PCI: $pci_addr)"
+                        fi
+                    else
+                        echo "No module bay ID found for $bay_name (PCI: $pci_addr)"
+                    fi
+                else
+                    echo "Skipping module assignment: no PCI address for $interface"
+                fi
+            else
+                echo "Skipping module assignment for interface: $interface (type: $INTERFACE_TYPE)"
+            fi
+
             # Display information
             cat << EOF
     Interface: $interface
@@ -916,8 +955,9 @@ detect_and_create_network_interfaces() {
     IPv6:      $IPV6_ADDRESS
     -------------------------
 EOF
+
             # Create or Update Interfaces
-            _create_or_update_interface "$device_id" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU" "$ACTIVE"
+            _create_or_update_interface "$device_id" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU" "$ACTIVE" "$MASTER_ID" "$MODULE_ID_FOR_INTERFACE"
 
             # Check for missing objects
             if [[ -n "$MAC_ADDRESS" ]]; then
@@ -1399,7 +1439,7 @@ create_ipmi_interface() {
 EOF
 
         # Create missing console ports
-        _create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" "" ""
+        _create_or_update_interface "$device_id" "IPMI" "$ipmi_mac" "other" "" "1500" "UP" "" ""
         echo ""
         echo "  IPMI interface created."
 
@@ -2890,6 +2930,261 @@ _create_gpu_module_in_netbox() {
 }
 
 #######################################################################################
+# Network Cards
+#######################################################################################
+
+# Global arrays for network interfaces
+declare -a nic_module_types=()
+declare -a nic_module_bays=()
+declare -a nic_modules=()
+
+_gather_nics_for_netbox() {
+    local device_id="$1"
+    nic_module_types=()
+    nic_module_bays=()
+    nic_modules=()
+
+    echo "Detecting Network Interfaces..."
+
+    # Use lshw for clean, structured NIC data
+    local lshw_output
+    lshw_output=$(sudo lshw -c network 2>/dev/null)
+    
+    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+        _debug_print "No NIC info from lshw"
+        return
+    fi
+
+    local product vendor bus_info serial interface_type
+    product=""
+    vendor=""
+    bus_info=""
+    serial=""
+    interface_type=""
+    
+    while IFS= read -r line; do
+        line="${line%$'\r'}"  # Remove Windows line endings
+        
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        # Match network sections: *-network, *-network:0, *-network:1, etc.
+        if [[ "$line" =~ ^[[:space:]]*\*-network ]]; then
+            # Process previous NIC if complete
+            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]] && [[ -n "$serial" ]]; then
+                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+                
+                # Determine interface type
+                local nic_type="Ethernet"
+                if [[ "$product" == *"Infiniband"* ]] || [[ "$product" == *"ConnectX"* ]]; then
+                    nic_type="Infiniband"
+                elif [[ "$product" == *"Wireless"* ]] || [[ "$product" == *"Wi-Fi"* ]]; then
+                    nic_type="Wireless"
+                fi
+                
+                _process_nic_device "$device_id" "$pci_address" "$product" "$vendor" "$serial" "$nic_type"
+            fi
+            
+            # Reset for new NIC
+            product=""
+            vendor=""
+            bus_info=""
+            serial=""
+            interface_type=""
+            continue
+        fi
+        
+        # Only process indented child lines
+        if [[ "$line" == *" "* ]] && [[ ! "$line" =~ ^[[:space:]]*\*- ]]; then
+            if [[ "$line" == *"product:"* ]]; then
+                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"vendor:"* ]]; then
+                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"bus info:"* ]]; then
+                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            elif [[ "$line" == *"serial:"* ]]; then
+                serial=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            fi
+        fi
+    done <<< "$lshw_output"
+    
+    # Handle the last NIC
+    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]] && [[ -n "$serial" ]]; then
+        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+        local nic_type="Ethernet"
+        if [[ "$product" == *"Infiniband"* ]] || [[ "$product" == *"ConnectX"* ]]; then
+            nic_type="Infiniband"
+        elif [[ "$product" == *"Wireless"* ]] || [[ "$product" == *"Wi-Fi"* ]]; then
+            nic_type="Wireless"
+        fi
+        _process_nic_device "$device_id" "$pci_address" "$product" "$vendor" "$serial" "$nic_type"
+    fi
+}
+
+_process_nic_device() {
+    local device_id="$1" pci_address="$2" model="$3" manufacturer="$4" mac_address="$5" interface_type="$6"
+
+    # Clean up manufacturer name
+    case "$manufacturer" in
+        *"Intel"*) manufacturer="Intel" ;;
+        *"Broadcom"*|*"NetXtreme"*) manufacturer="Broadcom" ;;
+        *"Mellanox"*|*"ConnectX"*) manufacturer="Mellanox" ;;
+        *"Chelsio"*) manufacturer="Chelsio" ;;
+        *"Realtek"*) manufacturer="Realtek" ;;
+        *"AMD"*|*"ATI"*) manufacturer="AMD" ;;
+        *) manufacturer="Unknown" ;;
+    esac
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Clean and truncate model name for NetBox limits
+    local clean_model="$model"
+    local truncated_model="${clean_model:0:100}"
+    local truncated_part_number="${clean_model:0:50}"
+
+    # Escape strings for JSON
+    pci_address="${pci_address//\"/\\\"}"
+    truncated_model="${truncated_model//\"/\\\"}"
+    truncated_part_number="${truncated_part_number//\"/\\\"}"
+    manufacturer="${manufacturer//\"/\\\"}"
+    mac_address="${mac_address//\"/\\\"}"
+    interface_type="${interface_type//\"/\\\"}"
+
+    # 1. MODULE TYPE (Expansion card) - Profile ID 7
+    local module_type_json="{"
+    module_type_json+="\"profile\":7,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$truncated_model\","
+    module_type_json+="\"part_number\":\"$truncated_part_number\","
+    module_type_json+="\"interface_type\":\"$interface_type\""
+    module_type_json+="}"
+    nic_module_types+=("$module_type_json")
+
+    # 2. MODULE BAY (PCIe slot)
+    local bay_name="PCIe-$pci_address"
+    local bay_json="{\"device\":$device_id,\"name\":\"$bay_name\",\"description\":\"Network Interface $pci_address\",\"label\":\"NIC\"}"
+    nic_module_bays+=("$bay_json")
+
+    # 3. MODULE (installed NIC instance) - MAC as serial
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$bay_name\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$truncated_model\"},\"serial\":\"$mac_address\"}"
+    nic_modules+=("$module_json")
+}
+
+_create_nic_module_in_netbox() {
+    local device_id="$1"
+    echo "Detecting NIC Items..."
+    _gather_nics_for_netbox "$device_id" || return 1
+
+    echo "Creating NIC modules in NetBox for device ID: $device_id"
+
+    # 1. Create ModuleTypes (deduplicated)
+    declare -A nic_module_type_map
+    for mt_json in "${nic_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        if [[ -z "$manuf" ]] || [[ -z "$model" ]]; then
+            _debug_print "Skipping empty NIC ModuleType"
+            continue
+        fi
+        
+        local key="${manuf}_${model}"
+        if [[ -z "${nic_module_type_map[$key]:-}" ]]; then
+            local encoded_manuf encoded_model
+            encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+            encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+            local exists_resp
+            exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+            local count
+            count=$(echo "$exists_resp" | jq -r '.count // 0')
+            if [[ "$count" -eq 0 ]]; then
+                _debug_print "Creating NIC ModuleType: $manuf / $model"
+                _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+            else
+                _debug_print "NIC ModuleType already exists: $manuf / $model"
+            fi
+            nic_module_type_map["$key"]=1
+        fi
+    done
+
+    # 2. Create ModuleBays AND store IDs
+    declare -A nic_module_bay_id_map
+    for bay_json in "${nic_module_bays[@]}"; do
+        local bay_name
+        bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local encoded_bay_name
+            encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists
+            bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count
+            bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "Creating NIC ModuleBay: $bay_name"
+                local bay_resp
+                bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id
+                bay_id=$(echo "$bay_resp" | jq -r '.id // empty' 2>/dev/null)
+                if [[ -n "$bay_id" ]]; then
+                    nic_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Created NIC ModuleBay $bay_name with ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for new NIC ModuleBay: $bay_name"
+                fi
+            else
+                echo "NIC ModuleBay already exists: $bay_name"
+                local bay_id
+                bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    nic_module_bay_id_map["$bay_name"]="$bay_id"
+                    _debug_print "Existing NIC ModuleBay $bay_name has ID: $bay_id"
+                else
+                    _debug_print "ERROR: Failed to get ID for existing NIC ModuleBay: $bay_name"
+                fi
+            fi
+        fi
+    done
+
+    # 3. Create Modules using ModuleBay IDs
+for mod_json in "${nic_modules[@]}"; do
+    local mod_bay_name
+    mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+    if [[ -n "$mod_bay_name" ]]; then
+        if [[ -n "${nic_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+            local bay_id="${nic_module_bay_id_map[$mod_bay_name]}"
+            local mod_exists
+            mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+            local mod_count
+            mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+            # Extract MAC address (stored as 'serial' in NIC module)
+            local mac_address
+            mac_address=$(echo "$mod_json" | jq -r '.serial // empty')
+            if [[ -z "$mac_address" ]]; then
+                _debug_print "WARNING: No MAC address (serial) found for NIC module in bay $mod_bay_name"
+                continue
+            fi
+            if [[ "$mod_count" -eq 0 ]]; then
+                local manuf=$(echo "$mod_json" | jq -r '.module_type.manufacturer.name // empty')
+                local model=$(echo "$mod_json" | jq -r '.module_type.model // empty')
+                local serial=$(echo "$mod_json" | jq -r '.serial // empty')
+                local fixed_mod_json="{\"device\":$device_id,\"module_bay\":$bay_id,\"module_type\":{\"manufacturer\":{\"name\":\"$manuf\"},\"model\":\"$model\"},\"serial\":\"$serial\"}"
+                echo "Creating NIC Module in bay: $mod_bay_name"
+                local create_resp
+                create_resp=$(_api_request "POST" "dcim/modules" "" "$fixed_mod_json")
+            else
+                echo "NIC Module already exists in bay: $mod_bay_name"
+            fi
+        else
+            _debug_print "ERROR: No NIC ModuleBay ID found for: $mod_bay_name"
+        fi
+    fi
+done
+
+    echo "NIC module sync completed."
+}
+
+#######################################################################################
 # Netbox Modules
 #######################################################################################
 # Module pyte custom atributes
@@ -2986,13 +3281,14 @@ create_modules() {
     local device_id="$1"
 
     echo ""
-    _ensure_module_type_profiles
+    #_ensure_module_type_profiles
 
     _create_cpu_module_in_netbox "$device_id"
     _create_memory_module_in_netbox "$device_id"
     _create_disk_module_in_netbox "$device_id"
     _create_controller_module_in_netbox "$device_id"
     _create_gpu_module_in_netbox "$device_id"
+    _create_nic_module_in_netbox "$device_id"
 }
 
 #######################################################################################
@@ -3002,15 +3298,16 @@ echo "Starting server registration in NetBox..."
 # Create Device
 create_devices
 
+# Create module items
+create_modules "$DEVICE_ID"
+
 # Create Network Interface MAC and IP
-#detect_and_create_network_interfaces "$DEVICE_ID"
+detect_and_create_network_interfaces "$DEVICE_ID"
 
 # Get LLDP neighbors in JSON format
 #get_lldp_neighbors "$DEVICE_ID"
 
-# Create module items
-create_modules "$DEVICE_ID"
+
 
 echo ""
 echo "Server registration completed!"
-

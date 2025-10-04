@@ -9,6 +9,7 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 * Create servers through standard tools (`dmidecode`)
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
   * Create IPMI interface if found
+    * network netmask for ip and prefix creation
 * Update existing `Device` and `Interface`
 * Local inventory using `Modules` for CPU, GPU, RAM, physical disks, Raid Controller, SAS Controller
 
@@ -30,7 +31,7 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 # Requirements
 
 - Netbox >= 3.7
-
+- jq
 - ip
 - ethtoop
 - dmidecode
