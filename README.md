@@ -9,9 +9,9 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 * Create servers through standard tools (`dmidecode`)
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
   * Create IPMI interface if found
-    * network netmask for ip and prefix creation
 * Update existing `Device` and `Interface`
 * Local inventory using `Modules` for CPU, GPU, RAM, physical disks, Raid Controller, SAS Controller
+* PSUs creation and power consumption reporting (based on vendor's tools)
 
 # Missing Features
 
@@ -25,7 +25,6 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
   * Handle blade moving (new slot, new chassis)
 * Update existing `Device` and `Interface`
   * Handle changes in physical disk, RAM
-* PSUs creation and power consumption reporting (based on vendor's tools)
 * Automatic cabling (server's interface to switch's interface) using lldp
 
 # Requirements
@@ -33,13 +32,13 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 - Netbox >= 3.7
 - jq
 - ip
-- ethtoop
-- dmidecode
+- ethtoop   ???
+- dmidecode ???
 - ipmitool
 - lldpd
 - smartmontools
 - lsblk
-- lshw
+- lshw      ???
 
 ## Inventory Optional requirement
 - hpassacli

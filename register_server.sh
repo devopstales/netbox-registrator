@@ -988,9 +988,6 @@ EOF
     else
         echo "No network interfaces detected."
     fi
-
-    # Create Console Port
-    create_ipmi_interface "$device_id"
 }
 
 #######################################################################################
@@ -1421,11 +1418,43 @@ create_ipmi_interface() {
     # Run ipmitool and capture output
     local output
     local ipmi_ip
+    local ipmi_netmask
     local ipmi_mac
+    local ipmi_cidr
 
     output=$(ipmitool lan print 1 2>/dev/null)
     ipmi_ip=$(echo "$output" | awk -F': ' '/^IP Address[[:space:]]*:/ {print $2; exit}')
+    ipmi_netmask=$(echo "$output" | awk -F': ' '/^Subnet Mask[[:space:]]*:/ {print $2; exit}')
     ipmi_mac=$(echo "$output" | awk -F': ' '/^MAC Address[[:space:]]*:/ {print $2; exit}')
+
+    if [[ -n "$ipmi_netmask" ]]; then
+        # Convert dotted decimal netmask to CIDR (e.g., 255.255.255.0 → 24)
+        local cidr_bits=0
+        local octet
+        IFS='.' read -r -a octets <<< "$ipmi_netmask"
+        for octet in "${octets[@]}"; do
+            case "$octet" in
+                255) cidr_bits=$((cidr_bits + 8)) ;;
+                254) cidr_bits=$((cidr_bits + 7)) ;;
+                252) cidr_bits=$((cidr_bits + 6)) ;;
+                248) cidr_bits=$((cidr_bits + 5)) ;;
+                240) cidr_bits=$((cidr_bits + 4)) ;;
+                224) cidr_bits=$((cidr_bits + 3)) ;;
+                192) cidr_bits=$((cidr_bits + 2)) ;;
+                128) cidr_bits=$((cidr_bits + 1)) ;;
+                0) ;;
+                *) cidr_bits=0; break ;;  # Invalid netmask
+            esac
+        done
+        
+        if [[ "$cidr_bits" -gt 0 ]] && [[ "$cidr_bits" -le 32 ]]; then
+            ipmi_cidr="$ipmi_ip/$cidr_bits"
+        else
+            _debug_print "Invalid netmask '$ipmi_netmask'"
+        fi
+    else
+        _debug_print "No netmask detected for IPMI IP $ipmi_ip"
+    fi
 
     # test console port on device
     if _has_ipmi_interface; then
@@ -1435,6 +1464,8 @@ create_ipmi_interface() {
   Type:      other
   MAC:       $ipmi_mac
   IPv4:      $ipmi_ip
+  Netmask:   $ipmi_netmask
+  CIDR:      $ipmi_cidr
   -------------------------
 EOF
 
@@ -1452,7 +1483,10 @@ EOF
         fi
 
         # Create IP address
-        if [[ -n "$ipmi_ip" ]]; then
+        if [[ -n "$ipmi_cidr" ]]; then
+            echo "  IPv4 Address found: $ipmi_cidr"
+            create_ip_address "$ipmi_cidr" "$(_get_interface_details "$device_id" | jq -r --arg name "IPMI" '.results[] | select(.name == $name) | .id // empty')"
+        elif [[ -n "$ipmi_ip" ]]; then
             echo "  IPv4 Address found: $ipmi_ip"
             create_ip_address "$ipmi_ip" "$(_get_interface_details "$device_id" | jq -r --arg name "IPMI" '.results[] | select(.name == $name) | .id // empty')"
         else
@@ -2365,12 +2399,8 @@ _gather_controllers_for_netbox() {
     if command -v lshw &> /dev/null; then
         _debug_print "Using lshw"
         _detect_controllers_with_lshw "$device_id"
-    # Fall back to lspci if lshw not available
-    elif command -v lspci &> /dev/null; then
-        _debug_print "Using lspci"
-        _detect_controllers_with_lspci "$device_id"
     else
-        echo "Error: No controller detection tools available (lshw or lspci)" >&2
+        echo "Error: Tool lshw is not available" >&2
         return 1
     fi
 }
@@ -2464,56 +2494,6 @@ _detect_controllers_with_lshw() {
         
         _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
     fi
-}
-
-_detect_controllers_with_lspci() {
-    local device_id="$1"
-    
-    local controllers
-    controllers=$(lspci -vvv | grep -A20 -E "RAID bus controller|Serial Attached SCSI controller")
-
-    if [[ -z "$controllers" ]]; then
-        _debug_print "No controllers found with lspci"
-        return
-    fi
-
-    local pci_address model
-    while IFS= read -r line; do
-        if [[ "$line" == *"RAID bus controller"* ]] || [[ "$line" == *"Serial Attached SCSI controller"* ]]; then
-            pci_address=$(echo "$line" | cut -d' ' -f1)
-            model=$(echo "$line" | sed 's/^[^:]*: //' | _trim)
-            
-            # Determine manufacturer from model
-            local manufacturer="Unknown"
-            if [[ "$model" == *"Broadcom"* ]] || [[ "$model" == *"LSI"* ]]; then
-                manufacturer="Broadcom"
-            elif [[ "$model" == *"Intel"* ]]; then
-                manufacturer="Intel"
-            elif [[ "$model" == *"Marvell"* ]]; then
-                manufacturer="Marvell"
-            elif [[ "$model" == *"AMD"* ]] || [[ "$model" == *"ATI"* ]]; then
-                manufacturer="AMD"
-            fi
-            
-            # Determine controller type
-            local ctrl_type="Controller"
-            if [[ "$line" == *"RAID bus controller"* ]]; then
-                ctrl_type="RAID"
-            elif [[ "$line" == *"Serial Attached SCSI controller"* ]]; then
-                ctrl_type="SAS"
-            fi
-            
-            # Get firmware version (if available)
-            local firmware_version=""
-            if [[ "$manufacturer" == "Broadcom" ]]; then
-                if command -v megacli &> /dev/null; then
-                    firmware_version=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | _trim)
-                fi
-            fi
-            
-            _process_controller_device "$device_id" "$pci_address" "$model" "$manufacturer" "$ctrl_type" "$firmware_version"
-        fi
-    done <<< "$controllers"
 }
 
 _process_controller_device() {
@@ -2699,12 +2679,8 @@ _gather_gpus_for_netbox() {
     if command -v lshw &> /dev/null; then
         _debug_print "Using lshw"
         _detect_gpus_with_lshw "$device_id"
-    # Fall back to lspci if lshw not available
-    elif command -v lspci &> /dev/null; then
-        _debug_print "Using lspci"
-        _detect_gpus_with_lspci "$device_id"
     else
-        echo "Error: No GPU detection tools available (lshw or lspci)" >&2
+        echo "Error: Tool lshw is not available" >&2
         return 1
     fi
 }
@@ -3185,57 +3161,281 @@ done
 }
 
 #######################################################################################
+# PSU
+#######################################################################################
+
+declare -a psu_module_types=()
+declare -a psu_module_bays=()
+declare -a psu_modules=()
+declare -a psu_power_ports=()
+
+_ensure_manufacturer() {
+    local name="$1"
+
+    # Normalize and reject placeholder values
+    case "${name,,}" in
+        *"to be filled by o.e.m."*|*"not specified"*|*"none"*|*"default string"*|*"system product name"*)
+            name="Generic"
+            ;;
+    esac
+
+    # Generate valid slug
+    local slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:] ._' | tr ' ' '-' | sed 's/[^a-z0-9_-]//g' | sed 's/-$//; s/^-//')
+    [[ -z "$slug" ]] && slug="generic"
+
+    # Check existence
+    local safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
+    local resp=$(_api_request "GET" "dcim/manufacturers" "?name=$safe_name" "")
+    local count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -eq 0 ]]; then
+        _debug_print "Creating manufacturer: $name (slug: $slug)"
+        local payload="{\"name\":\"$name\",\"slug\":\"$slug\"}"
+        _api_request "POST" "dcim/manufacturers" "" "$payload" >/dev/null
+    else
+        _debug_print "Manufacturer exists: $name"
+    fi
+}
+
+_gather_psus_for_netbox() {
+    local device_id="$1"
+    psu_module_types=()
+    psu_module_bays=()
+    psu_modules=()
+    psu_power_ports=()
+
+    echo "Detecting Power Supply Units (PSUs)..."
+
+    if ! command -v dmidecode &> /dev/null; then
+        _debug_print "dmidecode not available – skipping PSU detection"
+        return 0
+    fi
+
+    local dmidecode_cmd="dmidecode -t 39"
+    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t 39"
+
+    local output
+    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
+        _debug_print "dmidecode failed for PSU info"
+        return 0
+    }
+
+    [[ -z "$output" ]] && { _debug_print "No PSU data from dmidecode"; return 0; }
+
+    local location manufacturer model serial max_power hot_swappable
+    local in_psu=false
+    local psu_index=0
+
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        if [[ "$line" == "System Power Supply" ]]; then
+            location=""; manufacturer=""; model=""; serial=""; max_power=""; hot_swappable=""
+            in_psu=true
+            ((psu_index++))
+            continue
+        elif [[ -z "$line" ]] && [[ "$in_psu" == true ]]; then
+            _process_psu_device "$device_id" "$psu_index" "$location" "$manufacturer" "$model" "$serial" "$max_power" "$hot_swappable"
+            in_psu=false
+        elif [[ "$in_psu" == true ]] && [[ -n "$line" ]]; then
+            case "$line" in
+                "Location:"*)            location="$(_trim "${line#*: }")" ;;
+                "Manufacturer:"*)        manufacturer="$(_trim "${line#*: }")" ;;
+                "Name:"*)                model="$(_trim "${line#*: }")" ;;
+                "Serial Number:"*)       serial="$(_trim "${line#*: }")" ;;
+                "Max Power Capacity:"*)  max_power="$(_trim "${line#*: }")" ;;
+                *"Hot Replaceable"*)     hot_swappable="true" ;;
+            esac
+        fi
+    done <<< "$output"
+
+    # Handle last PSU if unterminated
+    if [[ "$in_psu" == true ]]; then
+        _process_psu_device "$device_id" "$psu_index" "$location" "$manufacturer" "$model" "$serial" "$max_power" "$hot_swappable"
+    fi
+}
+
+_process_psu_device() {
+    local device_id="$1" index="$2" location="$3" manufacturer="$4" model="$5" serial="$6" max_power_raw="$7" hot_swappable="$8"
+
+    # Skip empty or placeholder entries
+    if [[ "$manufacturer" == "To Be Filled By O.E.M." ]] || [[ -z "$manufacturer" ]] || [[ "$manufacturer" == "Not Specified" ]]; then
+        manufacturer="Generic"
+    fi
+
+    if [[ "$model" == "To Be Filled By O.E.M." ]] || [[ -z "$model" ]] || [[ "$model" == "Not Specified" ]]; then
+        model="PSU (Undetected)"
+    fi
+
+    if [[ "$serial" == "To Be Filled By O.E.M." ]] || [[ -z "$serial" ]] || [[ "$serial" == "Not Specified" ]]; then
+        serial="Undetected"
+    fi
+
+    # Normalize location or use index
+    local bay_name="PSU$index"
+    [[ -n "$location" ]] && [[ "$location" != "Not Specified" ]] && bay_name="$location"
+
+    # Ensure manufacturer exists
+    _ensure_manufacturer "$manufacturer"
+
+    # Parse max power (e.g., "800 W" → 800)
+    local wattage=1
+    if [[ -n "$max_power_raw" ]]; then
+        wattage=$(echo "$max_power_raw" | sed 's/[^0-9]*//g')
+        [[ -z "$wattage" ]] && wattage=1
+    fi
+
+    # Default hot-swappable to false if not detected
+    [[ -z "$hot_swappable" ]] && hot_swappable="false"
+
+    # === Infer input_current and input_voltage ===
+    # dmidecode rarely provides these, so use safe defaults
+    local input_current="AC"
+    local input_voltage=120
+
+    # Optional: enhance with IPMI later if needed (e.g., via `ipmitool sensor list | grep -i voltage`)
+
+    # Escape strings for JSON
+    manufacturer="${manufacturer//\"/\\\"}"
+    model="${model//\"/\\\"}"
+    serial="${serial//\"/\\\"}"
+    bay_name="${bay_name//\"/\\\"}"
+
+    # Use a generic model if empty
+    local psu_model="$model"
+    [[ -z "$psu_model" ]] && psu_model="PSU-$index"
+
+    # === 1. MODULE TYPE (Power Supply profile – ID 6) ===
+    local module_type_json="{"
+    module_type_json+="\"profile\":6,"
+    module_type_json+="\"manufacturer\":{\"name\":\"$manufacturer\"},"
+    module_type_json+="\"model\":\"$psu_model\","
+    module_type_json+="\"part_number\":\"$psu_model\","
+    module_type_json+="\"attributes\":{"
+    module_type_json+="\"wattage\":$wattage,"
+    module_type_json+="\"hot_swappable\":$hot_swappable,"
+    module_type_json+="\"input_current\":\"$input_current\","
+    module_type_json+="\"input_voltage\":$input_voltage"
+    module_type_json+="}"
+    module_type_json+="}"
+    psu_module_types+=("$module_type_json")
+
+    # === 2. MODULE BAY ===
+    local bay_json="{\"device\":$device_id,\"name\":\"$bay_name\",\"description\":\"Power Supply Bay\",\"label\":\"PSU\"}"
+    psu_module_bays+=("$bay_json")
+
+    # === 3. MODULE (installed PSU) ===
+    local module_json="{\"device\":$device_id,\"module_bay\":{\"name\":\"$bay_name\"},\"module_type\":{\"manufacturer\":{\"name\":\"$manufacturer\"},\"model\":\"$psu_model\"}"
+    [[ -n "$serial" ]] && module_json+=",\"serial\":\"$serial\""
+    module_json+="}"
+    psu_modules+=("$module_json")
+
+    # === 4. POWER PORT (for cabling) ===
+    local power_port_name="${bay_name}_IN"
+    local power_port_json="{"
+    power_port_json+="\"device\":$device_id,"
+    power_port_json+="\"name\":\"$power_port_name\","
+    power_port_json+="\"type\":\"iec-60320-c14\","
+    power_port_json+="\"maximum_draw\":$wattage"
+    power_port_json+="}"
+    psu_power_ports+=("$power_port_json")
+}
+
+
+_create_psu_modules_in_netbox() {
+    local device_id="$1"
+    echo "Creating PSU Modules and Power Ports in NetBox..."
+
+    _gather_psus_for_netbox "$device_id" || return 0
+
+    # === 1. Create ModuleTypes (deduplicated) ===
+    declare -A psu_module_type_map
+    for mt_json in "${psu_module_types[@]}"; do
+        local manuf=$(echo "$mt_json" | jq -r '.manufacturer.name // empty')
+        local model=$(echo "$mt_json" | jq -r '.model // empty')
+        if [[ -n "$manuf" ]] && [[ -n "$model" ]]; then
+            local key="${manuf}_${model}"
+            if [[ -z "${psu_module_type_map[$key]:-}" ]]; then
+                local encoded_manuf=$(printf '%s' "$manuf" | jq -sRr 'split("\n") | .[0] | @uri')
+                local encoded_model=$(printf '%s' "$model" | jq -sRr 'split("\n") | .[0] | @uri')
+                local exists_resp=$(_api_request "GET" "dcim/module-types" "?manufacturer=$encoded_manuf&model=$encoded_model" "")
+                local count=$(echo "$exists_resp" | jq -r '.count // 0')
+                if [[ "$count" -eq 0 ]]; then
+                    _debug_print "Creating PSU ModuleType: $manuf / $model"
+                    _api_request "POST" "dcim/module-types" "" "$mt_json" >/dev/null
+                else
+                    _debug_print "PSU ModuleType exists: $manuf / $model"
+                fi
+                psu_module_type_map["$key"]=1
+            fi
+        fi
+    done
+
+    # === 2. Create ModuleBays + store IDs ===
+    declare -A psu_module_bay_id_map
+    for bay_json in "${psu_module_bays[@]}"; do
+        local bay_name=$(echo "$bay_json" | jq -r '.name // empty')
+        if [[ -n "$bay_name" ]]; then
+            local encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+            local bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
+            local bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
+            if [[ "$bay_count" -eq 0 ]]; then
+                echo "  Creating PSU ModuleBay: $bay_name"
+                local bay_resp=$(_api_request "POST" "dcim/module-bays" "" "$bay_json")
+                local bay_id=$(echo "$bay_resp" | jq -r '.id // empty')
+                if [[ -n "$bay_id" ]]; then
+                    psu_module_bay_id_map["$bay_name"]="$bay_id"
+                fi
+            else
+                local bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
+                psu_module_bay_id_map["$bay_name"]="$bay_id"
+            fi
+        fi
+    done
+
+    # === 3. Create Modules ===
+    for mod_json in "${psu_modules[@]}"; do
+        local mod_bay_name=$(echo "$mod_json" | jq -r '.module_bay.name // empty')
+        if [[ -n "$mod_bay_name" ]] && [[ -n "${psu_module_bay_id_map[$mod_bay_name]:-}" ]]; then
+            local bay_id="${psu_module_bay_id_map[$mod_bay_name]}"
+            local mod_exists=$(_api_request "GET" "dcim/modules" "?device_id=$device_id&module_bay_id=$bay_id" "")
+            local mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
+            if [[ "$mod_count" -eq 0 ]]; then
+                local fixed_mod_json=$(echo "$mod_json" | jq --arg id "$bay_id" '.module_bay = ($id | tonumber)')
+                echo "  Creating PSU Module in bay: $mod_bay_name"
+                _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
+            else
+                echo "  PSU Module already exists in bay: $mod_bay_name"
+            fi
+        fi
+    done
+
+    # === 4. Create Power Ports ===
+    for pp_json in "${psu_power_ports[@]}"; do
+        local pp_name=$(echo "$pp_json" | jq -r '.name // empty')
+        if [[ -n "$pp_name" ]]; then
+            local pp_exists=$(_api_request "GET" "dcim/power-ports" "?device_id=$device_id&name=$pp_name" "")
+            local pp_count=$(echo "$pp_exists" | jq -r '.count // 0')
+            if [[ "$pp_count" -eq 0 ]]; then
+                echo "  Creating Power Port: $pp_name"
+                _api_request "POST" "dcim/power-ports" "" "$pp_json" >/dev/null
+            else
+                echo "  Power Port already exists: $pp_name"
+            fi
+        fi
+    done
+
+    echo "PSU sync completed."
+}
+
+#######################################################################################
 # Netbox Modules
 #######################################################################################
-# Module pyte custom atributes
-## CPU
-# architecture, cores, speed
-## RAM
-# data_rate, size
 
 _ensure_module_type_profiles() {
     echo "Ensuring required ModuleType Profiles exist..."
 
     # Define required profiles
     declare -A required_profiles=(
-        ["Memory"]="{
-            \"name\": \"Memory\",
-            \"description\": \"RAM modules\",
-            \"schema\": {
-                \"properties\": {
-                    \"size\": {\"type\": \"integer\", \"description\": \"Capacity in GB\"},
-                    \"class\": {\"type\": \"string\", \"enum\": [\"DDR3\", \"DDR4\", \"DDR5\"]},
-                    \"data_rate\": {\"type\": \"integer\", \"description\": \"Speed in MT/s\"},
-                    \"ecc\": {\"type\": \"boolean\", \"description\": \"Error-correcting code enabled\"}
-                },
-                \"required\": [\"size\", \"class\"]
-            }
-        }"
-        ["CPU"]="{
-            \"name\": \"CPU\",
-            \"description\": \"Processor modules\",
-            \"schema\": {
-                \"properties\": {
-                    \"cores\": {\"type\": \"integer\"},
-                    \"threads\": {\"type\": \"integer\"},
-                    \"clock_speed\": {\"type\": \"number\", \"description\": \"Clock speed in GHz\"},
-                    \"socket\": {\"type\": \"string\"}
-                },
-                \"required\": [\"cores\", \"socket\"]
-            }
-        }"
-        ["Hard disk"]="{
-            \"name\": \"Hard disk\",
-            \"description\": \"Storage devices\",
-            \"schema\": {
-                \"properties\": {
-                    \"size\": {\"type\": \"integer\", \"description\": \"Raw disk capacity in GB\"},
-                    \"speed\": {\"type\": \"integer\", \"description\": \"Speed in RPM (0 for SSD)\"},
-                    \"type\": {\"type\": \"string\", \"enum\": [\"HD\", \"SSD\", \"NVME\"]}
-                },
-                \"required\": [\"size\"]
-            }
-        }"
         ["Controller"]="{
             \"name\": \"Controller\",
             \"description\": \"SAS/RAID/HBA controllers\",
@@ -3281,7 +3481,7 @@ create_modules() {
     local device_id="$1"
 
     echo ""
-    #_ensure_module_type_profiles
+    _ensure_module_type_profiles
 
     _create_cpu_module_in_netbox "$device_id"
     _create_memory_module_in_netbox "$device_id"
@@ -3289,6 +3489,7 @@ create_modules() {
     _create_controller_module_in_netbox "$device_id"
     _create_gpu_module_in_netbox "$device_id"
     _create_nic_module_in_netbox "$device_id"
+    _create_psu_modules_in_netbox "$device_id"
 }
 
 #######################################################################################
@@ -3303,6 +3504,8 @@ create_modules "$DEVICE_ID"
 
 # Create Network Interface MAC and IP
 detect_and_create_network_interfaces "$DEVICE_ID"
+# Create Console Port
+create_ipmi_interface "$DEVICE_ID"
 
 # Get LLDP neighbors in JSON format
 #get_lldp_neighbors "$DEVICE_ID"
