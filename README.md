@@ -29,16 +29,16 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 
 # Requirements
 
-- Netbox >= 3.7
+- Netbox >= 4.0
 - jq
 - ip
-- ethtoop   ???
-- dmidecode ???
+- ethtoop
+- dmidecode
 - ipmitool
 - lldpd
 - smartmontools
 - lsblk
-- lshw      ???
+- lshw
 
 ## Inventory Optional requirement
 - hpassacli

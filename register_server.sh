@@ -161,9 +161,16 @@ _trim() {
 
 _ensure_manufacturer() {
     local name="$1"
+
+    # Normalize and reject placeholder values
+    case "${name,,}" in
+        *"to be filled by o.e.m."*|*"not specified"*|*"none"*|*"default string"*|*"system product name"*)
+            name="Generic"
+            ;;
+    esac
+
     # Trim and escape for URL
-    local safe_name
-    safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | gsub(" "; "%20")')
+    local safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
     
     # Check if manufacturer exists
     local resp
@@ -173,7 +180,7 @@ _ensure_manufacturer() {
     
     if [[ "$count" -eq 0 ]]; then
         _debug_print "Creating manufacturer: $name"
-        local payload="{\"name\":\"$name\",\"slug\":\"$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '-' | tr -d "'")\"}"
+        local payload="{\"name\":\"$safe_name\",\"slug\":\"$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '-' | tr -d "'")\"}"
         _api_request "POST" "dcim/manufacturers" "" "$payload" >/dev/null
     else
         _debug_print "Manufacturer exists: $name"
@@ -764,7 +771,7 @@ _get_interface_pci_address() {
     fi
 
     _debug_print "PCI Address Not found"
-    return 1
+    #return 1
 }
 
 _get_interface_details() {
@@ -782,8 +789,8 @@ _create_or_update_interface() {
     local speed="$5"
     local mtu="$6"
     local active="$7"
-    local parent_interface_id=""
-    local module_id="${8:-}"  # Optional module ID
+    local parent_interface_id="$8"
+    local module_id="${9:-}"  # Optional module ID
 
     # Get existing interface details
     local existing_interface_info
@@ -873,6 +880,7 @@ detect_and_create_network_interfaces() {
 
     local device_id="$1"
     INTERFACES=$(_detect_network_interfaces)
+    MASTER_ID=""
 
     if [[ -n "$INTERFACES" ]]; then
         echo "Found network interfaces, creating in NetBox..."
@@ -925,12 +933,11 @@ detect_and_create_network_interfaces() {
                     bay_exists=$(_api_request "GET" "dcim/module-bays" "?device_id=$device_id&name=$encoded_bay_name" "")
                     bay_count=$(echo "$bay_exists" | jq -r '.count // 0')
                     if [[ "$bay_count" -gt 0 ]]; then
-                        bay_id=$(echo "$bay_exists" | jq -r '.results[0].id // empty')
-                        if [[ -n "$bay_id" ]]; then
-                            MODULE_ID_FOR_INTERFACE=$bay_id
+                        MODULE_ID_FOR_INTERFACE=$(echo "$bay_exists" | jq -r '.results[0].installed_module.id // empty')
+                        if [[ -n "$MODULE_ID_FOR_INTERFACE" ]]; then
                             echo "Found NIC module ID $MODULE_ID_FOR_INTERFACE in bay $bay_name (PCI: $pci_addr) for interface $interface"
                         else
-                            echo "No module found in bay $bay_name (PCI: $pci_addr)"
+                            echo "No installed module found in bay $bay_name (PCI: $pci_addr)"
                         fi
                     else
                         echo "No module bay ID found for $bay_name (PCI: $pci_addr)"
@@ -955,6 +962,14 @@ detect_and_create_network_interfaces() {
     IPv6:      $IPV6_ADDRESS
     -------------------------
 EOF
+
+            if [[ -n $MASTER ]]; then
+                interface_exists=$(_api_request "GET" "dcim/interfaces" "?device_id=$device_id&name=$MASTER" "")
+                interface_count=$(echo "$interface_exists" | jq -r '.count // 0')
+                if [[ "$interface_count" -eq 1 ]]; then
+                    MASTER_ID=$(echo "$interface_exists" | jq -r '.results[0].id // empty')
+                fi
+            fi
 
             # Create or Update Interfaces
             _create_or_update_interface "$device_id" "$interface" "$MAC_ADDRESS" "$INTERFACE_TYPE" "$SPEED" "$MTU" "$ACTIVE" "$MASTER_ID" "$MODULE_ID_FOR_INTERFACE"
@@ -2052,8 +2067,10 @@ _create_memory_module_in_netbox() {
                 mod_count=$(echo "$mod_exists" | jq -r '.count // 0')
                 
                 if [[ "$mod_count" -eq 0 ]]; then
-                    echo "  Creating Module in bay: $mod_bay_name"
-                    _api_request "POST" "dcim/modules" "" "$mod_json" >/dev/null
+                    local fixed_mod_json
+                    fixed_mod_json=$(echo "$mod_json" | jq --arg id "$bay_id" '.module_bay = ($id | tonumber)' 2>/dev/null)
+                    echo "  Creating RAM Module in bay: $mod_bay_name"
+                    _api_request "POST" "dcim/modules" "" "$fixed_mod_json" >/dev/null
                 else
                     echo "  Module already exists in bay: $mod_bay_name"
                 fi
@@ -3168,34 +3185,6 @@ declare -a psu_module_types=()
 declare -a psu_module_bays=()
 declare -a psu_modules=()
 declare -a psu_power_ports=()
-
-_ensure_manufacturer() {
-    local name="$1"
-
-    # Normalize and reject placeholder values
-    case "${name,,}" in
-        *"to be filled by o.e.m."*|*"not specified"*|*"none"*|*"default string"*|*"system product name"*)
-            name="Generic"
-            ;;
-    esac
-
-    # Generate valid slug
-    local slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:] ._' | tr ' ' '-' | sed 's/[^a-z0-9_-]//g' | sed 's/-$//; s/^-//')
-    [[ -z "$slug" ]] && slug="generic"
-
-    # Check existence
-    local safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
-    local resp=$(_api_request "GET" "dcim/manufacturers" "?name=$safe_name" "")
-    local count=$(echo "$resp" | jq -r '.count // 0')
-
-    if [[ "$count" -eq 0 ]]; then
-        _debug_print "Creating manufacturer: $name (slug: $slug)"
-        local payload="{\"name\":\"$name\",\"slug\":\"$slug\"}"
-        _api_request "POST" "dcim/manufacturers" "" "$payload" >/dev/null
-    else
-        _debug_print "Manufacturer exists: $name"
-    fi
-}
 
 _gather_psus_for_netbox() {
     local device_id="$1"
