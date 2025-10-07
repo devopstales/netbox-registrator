@@ -5,17 +5,19 @@
 
 set -euo pipefail
 
-# Configuration - Update these values for your environment
-NETBOX_URL="https://netbox.mydomain.intra"           # Your Netbox URL
-API_TOKEN="0123456789abcdef0123456789abcdef01234567" # Generate in Netbox: User -> API Tokens
-DEFAULT_SITE_SLUG="office"                                # Must exist in Netbox (slug)
-DEFAULT_ROLE="Server"                                # Must exist in Netbox
-DEFAULT_STATUS="active"                              # Options: active, staged, failed, inventory, decommissioning
-DEFAULT_DEVICE_TYPE=""                               # Optional: specify default device type
+# Source config file
+if [[ -f "./config.ini" ]]; then
+    echo "Loading Config"
+    source ./config.ini
+else
+    echo "Error: Missing ./config.ini"
+    exit 1
+fi
 
 # Default values (can be overridden by command line)
 DEVICE_NAME=$(hostname -f)
 DEVICE_TYPE=""
+CHASSIS_TYPE=""
 SERIAL=""
 ASSET_TAG=""
 COMMENTS=""
@@ -249,7 +251,7 @@ _create_device_payload() {
 create_devices() {
     # Auto-detect device type if enabled
     if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
-        DEVICE_TYPE=$(_detect_device_type)
+        _detect_device_type
         echo "Detected device type: $DEVICE_TYPE"
         if [[ -z "$DEVICE_TYPE" ]]; then
             echo "Error: Device type is required." >&2
@@ -307,44 +309,88 @@ create_devices() {
 
 # Function to detect device type automatically
 _detect_device_type() {
-    _debug_print "Starting device type detection..."
-    if command -v lshw >/dev/null 2>&1; then
-        local product_name
-        product_name=$(lshw -quiet -json -class system 2>/dev/null | jq -r '
-            if type == "array" then
-                .[0].product // empty
-            else
-                .product // empty
-            end
-        ')
-        if [[ -n "$product_name" ]]; then
-            # Clean up common DMI placeholders
-            product_name=$(echo "$product_name" | sed -E \
-                -e 's/ ?\(To be filled by O\.E\.M\.\)//g' \
-                -e 's/ ?\(None\)//g' \
-                -e 's/ ?\(System Product Name\)//g' \
-                -e 's/[[:space:]]+/ /g' \
-                -e 's/^\s+|\s+$//g' \
-                -e 's/\+$//g')
-            if [[ -n "$product_name" ]] && [[ "$product_name" != "Generic Server" ]]; then
-                echo "$product_name"
-                return 0
-            fi
-        fi
+    echo "Starting device type detection..."
+    local lshw_json sys_product mb_product
+    lshw_json=$(lshw -quiet -json 2>/dev/null)
+
+    if [ -z "$lshw_json" ]; then
+        echo "ERROR: lshw failed or returned no output." >&2
+        return 1
     fi
 
-    # Fallback to /sys if lshw fails or returns placeholder
-    if [[ -f "/sys/class/dmi/id/product_name" ]]; then
-        local PRODUCT_NAME
-        PRODUCT_NAME=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
-        if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "To be filled by O.E.M." && "$PRODUCT_NAME" != "None" ]]; then
-            echo "$PRODUCT_NAME"
+    # Extract system and motherboard product
+    sys_product=$(echo "$lshw_json" | jq -r '.product // empty')
+    mb_product=$(echo "$lshw_json" | jq -r '.children[] | select(.class == "bus" and .id == "core") | .product // empty')
+
+    sys_product=${sys_product:-""}
+    mb_product=${mb_product:-""}
+
+    # Clean system product (remove " (To be filled...)")
+    local clean_sys="${sys_product%% (*}"
+
+    # Blade detection patterns (case-insensitive, but we use literal match)
+    local blade_patterns=(
+        'SBI-' 'SBA-'
+        'TR-' 'TP-' 'BT-'
+        'SYS-5039' 'SYS-5038' 'SYS-202'
+    )
+
+    local blade_mb_patterns=(
+        '^X[5-8]' '^P4'
+    )
+
+    # Check system product for blade indicators
+    for pat in "${blade_patterns[@]}"; do
+        if [[ "$clean_sys" == *"$pat"* ]]; then
+            echo "system_type: blade"
+            echo "system_model: $mb_product"
+            echo "chassis_type: $clean_sys"
+            if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
+                DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
+            else
+                DEVICE_TYPE=$mb_product
+            fi
+            if [[ -n "$DEFAULT_CHASSIS_TYPE" ]]; then
+                CHASSIS_TYPE=$DEFAULT_CHASSIS_TYPE
+                echo "DEFAULT_CHASSIS_TYPE"
+            else
+                CHASSIS_TYPE=$clean_sys
+            fi
             return 0
         fi
-    fi
+    done
 
-    echo "Generic Server"
-    return 1
+    # Check motherboard product
+    for pat in "${blade_mb_patterns[@]}"; do
+        if [[ "$mb_product" =~ $pat ]]; then
+            echo "system_type: blade"
+            echo "system_model: $mb_product"
+            echo "chassis_type: $clean_sys"
+            if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
+                DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
+            else
+                DEVICE_TYPE=$mb_product
+            fi
+            if [[ -n "$DEFAULT_CHASSIS_TYPE" ]]; then
+                CHASSIS_TYPE=$DEFAULT_CHASSIS_TYPE
+                echo "DEFAULT_CHASSIS_TYPE"
+            else
+                CHASSIS_TYPE=$clean_sys
+            fi
+            return 0
+        fi
+    done
+
+    # Otherwise: standalone
+    echo "system_type: standalone"
+    echo "system_model: $mb_product"
+    echo "chassis_type: N/A"
+
+    if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
+        DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
+    else
+        DEVICE_TYPE=$mb_product
+    fi
 }
 
 # Function to detect serial number automatically

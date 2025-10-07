@@ -6,6 +6,7 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 
 # Features
 
+* Read Configs from config file or enviroment variable
 * Create servers through standard tools (`dmidecode`)
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
   * Create IPMI interface if found
@@ -15,7 +16,6 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 
 # Missing Features
 
-* Read Configs from config file or wnviroment variable
 * Generic ability to guess datacenters and rack location (Configure in config file)
 * Create or get existing VLAN and associate it to interfaces
 * Detect if server is a VM
@@ -33,7 +33,6 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 - jq
 - ip
 - ethtoop
-- dmidecode
 - ipmitool
 - lldpd
 - smartmontools
