@@ -113,7 +113,7 @@ _api_request() {
     local method="$1"
     local endpoint="$2"
     local parameter="$3"
-    local data="$4"
+    local data="${4:-}"
 
     local end_url
     if [[ -n "$parameter" ]]; then
@@ -161,30 +161,44 @@ _trim() {
 
 _ensure_manufacturer() {
     local name="$1"
+    local slug
+    slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-_' | tr -s '-' | sed 's/-$//; s/^-//')
 
-    # Normalize and reject placeholder values
-    case "${name,,}" in
-        *"to be filled by o.e.m."*|*"not specified"*|*"none"*|*"default string"*|*"system product name"*)
-            name="Generic"
-            ;;
-    esac
+    # Reset global
+    _CANONICAL_MANUFACTURER=""
 
-    # Trim and escape for URL
-    local safe_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
-    
-    # Check if manufacturer exists
+    # Try by name first
     local resp
-    resp=$(_api_request "GET" "dcim/manufacturers" "?name=$safe_name" "")
-    local count
-    count=$(echo "$resp" | jq -r '.count // 0')
-    
-    if [[ "$count" -eq 0 ]]; then
-        _debug_print "Creating manufacturer: $name"
-        local payload="{\"name\":\"$safe_name\",\"slug\":\"$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -s ' ' '-' | tr -d "'")\"}"
-        _api_request "POST" "dcim/manufacturers" "" "$payload" >/dev/null
-    else
+    resp=$(_api_request "GET" "dcim/manufacturers" "?name=$(printf '%s' "$name" | jq -sRr '@uri')" "")
+    if [[ $(echo "$resp" | jq -r '.count // 0') -gt 0 ]]; then
+        _CANONICAL_MANUFACTURER="$name"
         _debug_print "Manufacturer exists: $name"
+        return 0
     fi
+
+    # Try to create
+    local payload="{\"name\":\"$name\",\"slug\":\"$slug\"}"
+    resp=$(_api_request "POST" "dcim/manufacturers" "" "$payload")
+
+    if [[ "$resp" == *"slug"* ]] && [[ "$resp" == *"already exists"* ]]; then
+        _debug_print "Slug conflict for '$slug' – fetching existing manufacturer"
+        local by_slug
+        by_slug=$(_api_request "GET" "dcim/manufacturers" "?slug=$slug" "")
+        local count
+        count=$(echo "$by_slug" | jq -r '.count // 0')
+        if [[ "$count" -gt 0 ]]; then
+            _CANONICAL_MANUFACTURER=$(echo "$by_slug" | jq -r '.results[0].name')
+            _debug_print "Using canonical name: '$_CANONICAL_MANUFACTURER'"
+            return 0
+        fi
+    elif [[ "$resp" == *"id"* ]]; then
+        _CANONICAL_MANUFACTURER="$name"
+        _debug_print "Created manufacturer: $name"
+        return 0
+    fi
+
+    _debug_print "ERROR: Failed to ensure manufacturer '$name'"
+    return 1
 }
 
 #######################################################################################
@@ -245,7 +259,9 @@ create_devices() {
 
     # Auto-detect serial if not provided
     if [[ -z "$SERIAL" ]]; then
-        if SERIAL_DETECTED=$(_detect_serial 2>/dev/null); then
+        SERIAL_DETECTED=$(_detect_serial 2>/dev/null)
+
+        if [ $? -eq 0 ] && [ -n "$SERIAL_DETECTED" ]; then
             SERIAL="$SERIAL_DETECTED"
             echo "Detected serial number: $SERIAL"
         fi
@@ -255,6 +271,11 @@ create_devices() {
     local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG")
     local role_id=$(_get_role_id "$DEFAULT_ROLE")
     local device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
+
+    if [[ -z "$device_type_id" ]]; then
+        echo "ERROR: Device Type dose not exists: $DEVICE_TYPE"
+        exit 1
+    fi
 
     # Prepare comments
     local comments_payload="${COMMENTS:-}"
@@ -287,47 +308,72 @@ create_devices() {
 # Function to detect device type automatically
 _detect_device_type() {
     _debug_print "Starting device type detection..."
-    
-    if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
-        if PRODUCT_NAME=$(dmidecode -s system-product-name 2>/dev/null | tr -d '\0'); then
-            if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "To be filled by O.E.M." && "$PRODUCT_NAME" != "None" ]]; then
-                echo "$PRODUCT_NAME"
+    if command -v lshw >/dev/null 2>&1; then
+        local product_name
+        product_name=$(lshw -quiet -json -class system 2>/dev/null | jq -r '
+            if type == "array" then
+                .[0].product // empty
+            else
+                .product // empty
+            end
+        ')
+        if [[ -n "$product_name" ]]; then
+            # Clean up common DMI placeholders
+            product_name=$(echo "$product_name" | sed -E \
+                -e 's/ ?\(To be filled by O\.E\.M\.\)//g' \
+                -e 's/ ?\(None\)//g' \
+                -e 's/ ?\(System Product Name\)//g' \
+                -e 's/[[:space:]]+/ /g' \
+                -e 's/^\s+|\s+$//g' \
+                -e 's/\+$//g')
+            if [[ -n "$product_name" ]] && [[ "$product_name" != "Generic Server" ]]; then
+                echo "$product_name"
                 return 0
             fi
         fi
     fi
-    
+
+    # Fallback to /sys if lshw fails or returns placeholder
     if [[ -f "/sys/class/dmi/id/product_name" ]]; then
+        local PRODUCT_NAME
         PRODUCT_NAME=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
         if [[ -n "$PRODUCT_NAME" && "$PRODUCT_NAME" != "To be filled by O.E.M." && "$PRODUCT_NAME" != "None" ]]; then
             echo "$PRODUCT_NAME"
             return 0
         fi
     fi
-    
+
     echo "Generic Server"
     return 1
 }
 
 # Function to detect serial number automatically
 _detect_serial() {
-    if command -v dmidecode >/dev/null 2>&1 && [[ $EUID -eq 0 ]]; then
-        if SERIAL_NUM=$(dmidecode -s system-serial-number 2>/dev/null | tr -d '\0'); then
-            if [[ -n "$SERIAL_NUM" && "$SERIAL_NUM" != "To be filled by O.E.M." && "$SERIAL_NUM" != "None" ]]; then
-                echo "$SERIAL_NUM"
-                return 0
-            fi
+    if command -v lshw >/dev/null 2>&1; then
+        local serial
+        serial=$(lshw -quiet -json -class system 2>/dev/null | jq -r '
+            if type == "array" then
+                .[0].serial // empty
+            else
+                .serial // empty
+            end
+        ')
+        if [[ -n "$serial" && "$serial" != "To be filled by O.E.M." && "$serial" != "None" && "$serial" != "0" ]]; then
+            echo "$serial"
+            return 0
         fi
     fi
-    
+
     if [[ -f "/sys/class/dmi/id/product_serial" ]]; then
+        local SERIAL_NUM
         SERIAL_NUM=$(cat /sys/class/dmi/id/product_serial 2>/dev/null)
         if [[ -n "$SERIAL_NUM" && "$SERIAL_NUM" != "To be filled by O.E.M." && "$SERIAL_NUM" != "None" ]]; then
             echo "$SERIAL_NUM"
             return 0
         fi
     fi
-    
+
+    _debug_print "ERROR: Can't Detect Serial"
     return 1
 }
 
@@ -1639,49 +1685,41 @@ _gather_cpu_for_netbox() {
     cpu_module_bays=()
     cpu_modules=()
 
-    if ! command -v dmidecode &> /dev/null; then
-        echo "Error: dmidecode not installed" >&2
+    if ! command -v lshw >/dev/null 2>&1; then
+        echo "Error: lshw not installed" >&2
         return 1
     fi
 
-    local dmidecode_cmd="dmidecode -t processor"
-    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t processor"
-    
-    local output
-    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
-        echo "Error: dmidecode failed" >&2
+    local lshw_output
+    lshw_output=$(lshw -quiet -json -class processor 2>/dev/null)
+    if [[ -z "$lshw_output" ]]; then
+        echo "Error: No CPU data from lshw" >&2
         return 1
-    }
-    [[ -z "$output" ]] && { echo "Error: No CPU data" >&2; return 1; }
+    fi
 
-    local socket_designation manufacturer version core_count thread_count current_speed
-    local in_processor=false
+    # Normalize to array
+    if ! echo "$lshw_output" | jq -e '. | type == "array"' >/dev/null; then
+        lshw_output="[$lshw_output]"
+    fi
 
-    while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//')
-        
-        if [[ "$line" == "Processor Information" ]]; then
-            socket_designation=""; manufacturer=""; version=""; core_count=""; thread_count=""; current_speed=""
-            in_processor=true
-            continue
-        elif [[ -z "$line" ]] && [[ "$in_processor" == true ]]; then
+    local count i=0
+    count=$(echo "$lshw_output" | jq 'length')
+    while [[ $i -lt $count ]]; do
+        local cpu
+        cpu=$(echo "$lshw_output" | jq -c ".[$i]")
+        local socket_designation manufacturer version core_count thread_count current_speed
+        socket_designation=$(echo "$cpu" | jq -r '.slot // "CPU"')
+        manufacturer=$(echo "$cpu" | jq -r '.vendor // "Unknown"')
+        version=$(echo "$cpu" | jq -r '.product // empty')
+        core_count=$(echo "$cpu" | jq -r '.configuration.cores // "0"')
+        thread_count=$(echo "$cpu" | jq -r --arg cc "$core_count" '.configuration.threads // $cc')
+        current_speed=$(echo "$cpu" | jq -r '.capacity // "0"')
+
+        if [[ -n "$version" ]] && [[ "$version" != *"Not Specified"* ]] && [[ "$version" != *"Not Installed"* ]]; then
             _process_cpu_device "$device_id" "$socket_designation" "$manufacturer" "$version" "$core_count" "$thread_count" "$current_speed"
-            in_processor=false
-        elif [[ "$in_processor" == true ]] && [[ -n "$line" ]]; then
-            case "$line" in
-                "Socket Designation:"*)  socket_designation="$(_trim "${line#*: }")" ;;
-                "Manufacturer:"*)        manufacturer="$(_trim "${line#*: }")" ;;
-                "Version:"*)             version="$(_trim "${line#*: }")" ;;
-                "Core Count:"*)          core_count="$(_trim "${line#*: }")" ;;
-                "Thread Count:"*)        thread_count="$(_trim "${line#*: }")" ;;
-                "Current Speed:"*)       current_speed="$(_trim "${line#*: }")" ;;
-            esac
         fi
-    done <<< "$output"
-
-    if [[ "$in_processor" == true ]]; then
-        _process_cpu_device "$device_id" "$socket_designation" "$manufacturer" "$version" "$core_count" "$thread_count" "$current_speed"
-    fi
+        ((i++))
+    done
 }
 
 _process_cpu_device() {
@@ -1853,62 +1891,50 @@ declare -a memory_module_bays=()    # For ModuleBay creation
 declare -a memory_modules=()        # For Module creation
 
 _gather_memory_for_netbox() {
-    local device_id="$1"  # NetBox device ID or name
-
-    # Clear global arrays
-    memory_module_types=()
-    memory_module_bays=()
-    memory_modules=()
-
-    # ... [dmidecode execution logic - same as before] ...
-    if ! command -v dmidecode &> /dev/null; then
-        echo "Error: dmidecode not installed" >&2
+    local device_id="$1"
+    if ! command -v lshw >/dev/null 2>&1; then
+        echo "Error: lshw not installed" >&2
         return 1
     fi
 
-    local dmidecode_cmd="dmidecode -t 17"
-    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t 17"
-    
-    local output
-    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
-        echo "Error: dmidecode failed" >&2
+    local root_mem
+    root_mem=$(lshw -quiet -json -class memory 2>/dev/null)
+    if [[ -z "$root_mem" ]]; then
+        echo "Error: No memory data" >&2
         return 1
-    }
-    [[ -z "$output" ]] && { echo "Error: No memory data" >&2; return 1; }
-
-    local size type speed manufacturer part_number serial locator bank_locator
-    local in_device=false
-
-    while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//')
-        
-        if [[ "$line" == "Memory Device" ]]; then
-            size=""; type=""; speed=""; manufacturer=""; part_number=""; serial=""; locator=""; bank_locator=""
-            in_device=true
-            continue
-        elif [[ -z "$line" ]] && [[ "$in_device" == true ]]; then
-            _process_memory_device "$device_id" "$size" "$type" "$speed" "$manufacturer" "$part_number" "$serial" "$locator" "$bank_locator"
-            in_device=false
-        elif [[ "$in_device" == true ]] && [[ -n "$line" ]]; then
-            case "$line" in
-                "Size:"*)           size="$(_trim "${line#*: }")" ;;
-                "Type:"*)           type="$(_trim "${line#*: }")" ;;
-                "Speed:"*)          speed="$(_trim "${line#*: }")" ;;
-                "Manufacturer:"*)   manufacturer="$(_trim "${line#*: }")" ;;
-                "Part Number:"*)    part_number="$(_trim "${line#*: }")" ;;
-                "Serial Number:"*)  serial="$(_trim "${line#*: }")" ;;
-                "Locator:"*)        locator="$(_trim "${line#*: }")" ;;
-                "Bank Locator:"*)   bank_locator="$(_trim "${line#*: }")" ;;
-            esac
-        fi
-    done <<< "$output"
-
-    # Handle last device
-    if [[ "$in_device" == true ]]; then
-        _process_memory_device "$device_id" "$size" "$type" "$speed" "$manufacturer" "$part_number" "$serial" "$locator" "$bank_locator"
-    else
-        _debug_print "No device found"
     fi
+
+    # Extract DIMM banks (top-level entries with id="bank:*" and non-empty)
+    local dimms
+    dimms=$(echo "$root_mem" | jq -c '
+        .[] |
+        select(.id | startswith("bank:")) |
+        select(has("size"))
+    ')
+
+    if [[ -z "$dimms" ]]; then
+        _debug_print "No DIMMs found"
+        return 0
+    fi
+
+    while IFS= read -r mem; do
+        local size=$(echo "$mem" | jq -r '.size // empty')
+        [[ -z "$size" ]] && continue
+        local size_gb=$((size / 1000000000))
+        local manufacturer=$(echo "$mem" | jq -r '.vendor // "Unknown"')
+        local part_number=$(echo "$mem" | jq -r '.product // "Unknown"')
+        local serial=$(echo "$mem" | jq -r '.serial // "Unknown"')
+        local locator=$(echo "$mem" | jq -r '.slot // "DIMM"')
+        local bank_locator=$(echo "$mem" | jq -r '.physid // ""')
+        local type=$(echo "$mem" | jq -r '.description // "DRAM"')
+        local speed=$(echo "$mem" | jq -r '.clock // "0"')
+        local speed_mts=$((speed / 1000000))
+
+        _process_memory_device "$device_id" "${size_gb} GB" "$type" "${speed_mts} MT/s" "$manufacturer" "$part_number" "$serial" "$locator" "$bank_locator"
+    done <<< "$dimms"
+
+    _debug_print "Processed $(wc -l <<< "$dimms") DIMMs"
+    _debug_print "Module types count: ${#memory_module_types[@]}"
 }
 
 _process_memory_device() {
@@ -2411,106 +2437,51 @@ _gather_controllers_for_netbox() {
     controller_modules=()
 
     echo "Detecting Controllers..."
-
-    # Try lshw first (best structured output)
-    if command -v lshw &> /dev/null; then
-        _debug_print "Using lshw"
-        _detect_controllers_with_lshw "$device_id"
-    else
+    if ! command -v lshw >/dev/null 2>&1; then
         echo "Error: Tool lshw is not available" >&2
         return 1
     fi
-}
 
-_detect_controllers_with_lshw() {
-    local device_id="$1"
-    
-    local lshw_output
-    lshw_output=$(sudo lshw -c storage 2>/dev/null)
-    
-    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+    local output
+    output=$(lshw -quiet -json -class storage 2>/dev/null)
+    if [[ -z "$output" ]]; then
         _debug_print "No controller info from lshw"
-        return
+        return 0
     fi
 
-    # Process output line by line without aggressive trimming
-    local section=""
-    local product=""
-    local vendor=""
-    local bus_info=""
-    
-    while IFS= read -r line; do
-        # Remove trailing carriage returns (Windows line endings)
-        line="${line%$'\r'}"
-        
-        # Skip empty lines
-        if [[ -z "$line" ]]; then
-            continue
-        fi
-        
-        # Check for section start (*-raid, *-sas, *-sata)
-        if [[ "$line" =~ ^[[:space:]]*\*- ]]; then
-            # End previous section if we have complete data
-            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
-                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-                local ctrl_type="Controller"
-                if [[ "$section" == "*-raid" ]]; then
-                    ctrl_type="RAID"
-                elif [[ "$section" == "*-sas" ]]; then
-                    ctrl_type="SAS"
-                elif [[ "$section" == "*-sata" ]]; then
-                    ctrl_type="SATA"
-                fi
-                
-                # Get firmware for RAID controllers
-                local firmware=""
-                if [[ "$ctrl_type" == "RAID" ]] && command -v megacli &> /dev/null; then
-                    firmware=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-                fi
-                
-                _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
-            fi
-            
-            # Start new section
-            section="$line"
-            product=""
-            vendor=""
-            bus_info=""
-            continue
-        fi
-        
-        # Only process lines that are indented (child elements)
-        if [[ "$line" == *" "* ]] && [[ "$line" != "$section" ]]; then
-            # Extract field values (everything after first colon)
-            if [[ "$line" == *"product:"* ]]; then
-                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"vendor:"* ]]; then
-                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"bus info:"* ]]; then
-                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            fi
-        fi
-    done <<< "$lshw_output"
-    
-    # Handle the last controller
-    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
-        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-        local ctrl_type="Controller"
-        if [[ "$section" == "*-raid" ]]; then
-            ctrl_type="RAID"
-        elif [[ "$section" == "*-sas" ]]; then
-            ctrl_type="SAS"
-        elif [[ "$section" == "*-sata" ]]; then
-            ctrl_type="SATA"
-        fi
-        
-        local firmware=""
-        if [[ "$ctrl_type" == "RAID" ]] && command -v megacli &> /dev/null; then
-            firmware=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        fi
-        
-        _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
+    # Normalize to array if needed (though lshw -json always returns array)
+    if ! echo "$output" | jq -e '. | type == "array"' >/dev/null; then
+        output="[$output]"
     fi
+
+    # Process each controller WITHOUT subshell
+    while IFS= read -r ctrl; do
+        [[ -z "$ctrl" ]] && continue
+        local product vendor bus_info description
+        product=$(echo "$ctrl" | jq -r '.product // empty')
+        vendor=$(echo "$ctrl" | jq -r '.vendor // empty')
+        bus_info=$(echo "$ctrl" | jq -r '.businfo // empty')
+        description=$(echo "$ctrl" | jq -r '.description // empty')
+
+        if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+            local pci_address
+            pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+            local ctrl_type="Controller"
+            case "$description" in
+                *RAID*) ctrl_type="RAID" ;;
+                *SAS*)  ctrl_type="SAS" ;;
+                *SATA*) ctrl_type="SATA" ;;
+            esac
+
+            local firmware=""
+            if [[ "$ctrl_type" == "RAID" ]] && command -v megacli &> /dev/null; then
+                firmware=$(sudo megacli -adpfwinfo -aALL 2>/dev/null | grep "FW Version" | head -1 | awk -F: '{print $2}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            fi
+
+            _process_controller_device "$device_id" "$pci_address" "$product" "$vendor" "$ctrl_type" "$firmware"
+        fi
+    done < <(echo "$output" | jq -c '.[]')
+    _debug_print "Detected ${#controller_module_types[@]} controller(s)"
 }
 
 _process_controller_device() {
@@ -2691,73 +2662,34 @@ _gather_gpus_for_netbox() {
     gpu_modules=()
 
     echo "Detecting GPUs..."
-
-    # Try lshw first (best structured output)
-    if command -v lshw &> /dev/null; then
-        _debug_print "Using lshw"
-        _detect_gpus_with_lshw "$device_id"
-    else
+    if ! command -v lshw >/dev/null 2>&1; then
         echo "Error: Tool lshw is not available" >&2
         return 1
     fi
-}
 
-_detect_gpus_with_lshw() {
-    local device_id="$1"
-    
-    local lshw_output
-    lshw_output=$(sudo lshw -c display 2>/dev/null)
-    
-    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+    local output
+    output=$(lshw -quiet -json -class display 2>/dev/null)
+    if [[ -z "$output" ]]; then
         _debug_print "No GPU info from lshw"
-        return
+        return 0
     fi
 
-    local section=""
-    local product=""
-    local vendor=""
-    local bus_info=""
-    
-    while IFS= read -r line; do
-        line="${line%$'\r'}"  # Remove Windows line endings
-        
-        if [[ -z "$line" ]]; then
-            continue
-        fi
-        
-        # Match GPU sections: *-display
-        if [[ "$line" =~ ^[[:space:]]*\*-display ]]; then
-            # Process previous GPU if complete
-            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
-                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-                _process_gpu_device "$device_id" "$pci_address" "$product" "$vendor" "0"
-            fi
-            
-            # Reset for new GPU
-            section="$line"
-            product=""
-            vendor=""
-            bus_info=""
-            continue
-        fi
-        
-        # Only process indented child lines
-        if [[ "$line" == *" "* ]] && [[ "$line" != "$section" ]]; then
-            if [[ "$line" == *"product:"* ]]; then
-                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"vendor:"* ]]; then
-                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"bus info:"* ]]; then
-                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            fi
-        fi
-    done <<< "$lshw_output"
-    
-    # Handle last GPU
-    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
-        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-        _process_gpu_device "$device_id" "$pci_address" "$product" "$vendor" "0"
+    if ! echo "$output" | jq -e '. | type == "array"' >/dev/null; then
+        output="[$output]"
     fi
+
+    echo "$output" | jq -c '.[]' | while read -r gpu; do
+        local product vendor bus_info
+        product=$(echo "$gpu" | jq -r '.product // empty')
+        vendor=$(echo "$gpu" | jq -r '.vendor // empty')
+        bus_info=$(echo "$gpu" | jq -r '.businfo // empty')
+
+        if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]]; then
+            local pci_address
+            pci_address=$(echo "$bus_info" | sed 's/.*@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+            _process_gpu_device "$device_id" "$pci_address" "$product" "$vendor" "0"
+        fi
+    done
 }
 
 _process_gpu_device() {
@@ -2938,81 +2870,42 @@ _gather_nics_for_netbox() {
     nic_modules=()
 
     echo "Detecting Network Interfaces..."
+    if ! command -v lshw >/dev/null 2>&1; then
+        _debug_print "lshw not available – skipping NIC detection"
+        return 0
+    fi
 
-    # Use lshw for clean, structured NIC data
-    local lshw_output
-    lshw_output=$(sudo lshw -c network 2>/dev/null)
-    
-    if [[ -z "$lshw_output" ]] || [[ "$lshw_output" == *"No such file or directory"* ]]; then
+    local output
+    output=$(lshw -quiet -json -class network 2>/dev/null)
+    if [[ -z "$output" ]]; then
         _debug_print "No NIC info from lshw"
-        return
+        return 0
     fi
 
-    local product vendor bus_info serial interface_type
-    product=""
-    vendor=""
-    bus_info=""
-    serial=""
-    interface_type=""
-    
-    while IFS= read -r line; do
-        line="${line%$'\r'}"  # Remove Windows line endings
-        
-        if [[ -z "$line" ]]; then
-            continue
-        fi
-        
-        # Match network sections: *-network, *-network:0, *-network:1, etc.
-        if [[ "$line" =~ ^[[:space:]]*\*-network ]]; then
-            # Process previous NIC if complete
-            if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]] && [[ -n "$serial" ]]; then
-                local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-                
-                # Determine interface type
-                local nic_type="Ethernet"
-                if [[ "$product" == *"Infiniband"* ]] || [[ "$product" == *"ConnectX"* ]]; then
-                    nic_type="Infiniband"
-                elif [[ "$product" == *"Wireless"* ]] || [[ "$product" == *"Wi-Fi"* ]]; then
-                    nic_type="Wireless"
-                fi
-                
-                _process_nic_device "$device_id" "$pci_address" "$product" "$vendor" "$serial" "$nic_type"
-            fi
-            
-            # Reset for new NIC
-            product=""
-            vendor=""
-            bus_info=""
-            serial=""
-            interface_type=""
-            continue
-        fi
-        
-        # Only process indented child lines
-        if [[ "$line" == *" "* ]] && [[ ! "$line" =~ ^[[:space:]]*\*- ]]; then
-            if [[ "$line" == *"product:"* ]]; then
-                product=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"vendor:"* ]]; then
-                vendor=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"bus info:"* ]]; then
-                bus_info=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            elif [[ "$line" == *"serial:"* ]]; then
-                serial=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
-            fi
-        fi
-    done <<< "$lshw_output"
-    
-    # Handle the last NIC
-    if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]] && [[ -n "$serial" ]]; then
-        local pci_address=$(echo "$bus_info" | sed 's/.*pci@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
-        local nic_type="Ethernet"
-        if [[ "$product" == *"Infiniband"* ]] || [[ "$product" == *"ConnectX"* ]]; then
-            nic_type="Infiniband"
-        elif [[ "$product" == *"Wireless"* ]] || [[ "$product" == *"Wi-Fi"* ]]; then
-            nic_type="Wireless"
-        fi
-        _process_nic_device "$device_id" "$pci_address" "$product" "$vendor" "$serial" "$nic_type"
+    # Handle array or single object
+    if ! echo "$output" | jq -e '. | type == "array"' >/dev/null; then
+        output="[$output]"
     fi
+
+    echo "$output" | jq -c '.[]' | while read -r nic; do
+        local product vendor bus_info serial
+        product=$(echo "$nic" | jq -r '.product // empty')
+        vendor=$(echo "$nic" | jq -r '.vendor // empty')
+        bus_info=$(echo "$nic" | jq -r '.businfo // empty')
+        serial=$(echo "$nic" | jq -r '.serial // empty')
+
+        if [[ -n "$product" ]] && [[ -n "$vendor" ]] && [[ -n "$bus_info" ]] && [[ -n "$serial" ]]; then
+            local pci_address
+            pci_address=$(echo "$bus_info" | sed 's/.*@0000://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+            local nic_type="Ethernet"
+            if [[ "$product" == *"Infiniband"* ]] || [[ "$product" == *"ConnectX"* ]]; then
+                nic_type="Infiniband"
+            elif [[ "$product" == *"Wireless"* ]] || [[ "$product" == *"Wi-Fi"* ]]; then
+                nic_type="Wireless"
+            fi
+            _process_nic_device "$device_id" "$pci_address" "$product" "$vendor" "$serial" "$nic_type"
+        fi
+    done
 }
 
 _process_nic_device() {
@@ -3193,53 +3086,70 @@ _gather_psus_for_netbox() {
     psu_modules=()
     psu_power_ports=()
 
-    echo "Detecting Power Supply Units (PSUs)..."
-
-    if ! command -v dmidecode &> /dev/null; then
-        _debug_print "dmidecode not available – skipping PSU detection"
+    echo "Detecting PSUs via lshw..."
+    if ! command -v lshw >/dev/null 2>&1; then
+        _debug_print "lshw not available – skipping PSU detection"
         return 0
     fi
 
-    local dmidecode_cmd="dmidecode -t 39"
-    [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && sudo -n true &>/dev/null && dmidecode_cmd="sudo dmidecode -t 39"
-
-    local output
-    output=$(eval "$dmidecode_cmd" 2>/dev/null) || {
-        _debug_print "dmidecode failed for PSU info"
+    local lshw_output
+    lshw_output=$(lshw -quiet -json -class power 2>/dev/null)
+    if [[ -z "$lshw_output" ]]; then
+        _debug_print "No PSU data from lshw"
         return 0
-    }
+    fi
 
-    [[ -z "$output" ]] && { _debug_print "No PSU data from dmidecode"; return 0; }
-
-    local location manufacturer model serial max_power hot_swappable
-    local in_psu=false
-    local psu_index=0
-
-    while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//')
-        if [[ "$line" == "System Power Supply" ]]; then
-            location=""; manufacturer=""; model=""; serial=""; max_power=""; hot_swappable=""
-            in_psu=true
-            ((psu_index++))
+    echo "PSU Detected:"
+    local psu_json_array
+    psu_json_array=$(echo "$lshw_output" | jq -c 'if type == "array" then . else [.] end' 2>/dev/null || echo "[]")
+    
+    local index=1
+    local psu_count
+    psu_count=$(echo "$psu_json_array" | jq -r 'length')
+    
+    # Process each PSU entry
+    for ((i=0; i<psu_count; i++)); do
+        local psu_entry
+        psu_entry=$(echo "$psu_json_array" | jq -c ".[$i]")
+        
+        # Skip if no essential fields (optional safety)
+        local vendor product
+        vendor=$(echo "$psu_entry" | jq -r '.vendor // empty')
+        product=$(echo "$psu_entry" | jq -r '.product // empty')
+        if [[ -z "$vendor" ]] || [[ -z "$product" ]]; then
             continue
-        elif [[ -z "$line" ]] && [[ "$in_psu" == true ]]; then
-            _process_psu_device "$device_id" "$psu_index" "$location" "$manufacturer" "$model" "$serial" "$max_power" "$hot_swappable"
-            in_psu=false
-        elif [[ "$in_psu" == true ]] && [[ -n "$line" ]]; then
-            case "$line" in
-                "Location:"*)            location="$(_trim "${line#*: }")" ;;
-                "Manufacturer:"*)        manufacturer="$(_trim "${line#*: }")" ;;
-                "Name:"*)                model="$(_trim "${line#*: }")" ;;
-                "Serial Number:"*)       serial="$(_trim "${line#*: }")" ;;
-                "Max Power Capacity:"*)  max_power="$(_trim "${line#*: }")" ;;
-                *"Hot Replaceable"*)     hot_swappable="true" ;;
-            esac
         fi
-    done <<< "$output"
 
-    # Handle last PSU if unterminated
-    if [[ "$in_psu" == true ]]; then
-        _process_psu_device "$device_id" "$psu_index" "$location" "$manufacturer" "$model" "$serial" "$max_power" "$hot_swappable"
+        local location slot physid
+        slot=$(echo "$psu_entry" | jq -r '.slot // "PSU"')
+        physid=$(echo "$psu_entry" | jq -r '.physid')
+        location="$slot-$physid"
+        echo "  Slot: $location"
+        
+        local manufacturer="$vendor"
+        echo "  Manufacturer: $manufacturer"
+        
+        local model="$product"
+        echo "  Model: $model"
+        
+        local serial
+        serial=$(echo "$psu_entry" | jq -r '.serial // "Undetected"')
+        echo "  Serial: $serial"
+        
+        local wattage
+        wattage=$(echo "$psu_entry" | jq -r '.capacity // "1"')
+        wattage=${wattage//[!0-9]/}
+        wattage=${wattage:-1}
+        # Note: lshw reports capacity in mWh, but for PSU it's likely a mislabel — treat as watts
+        echo "  Wattage: $wattage W"
+        echo "  ------------------------------"
+
+        _process_psu_device "$device_id" "$index" "$location" "$manufacturer" "$model" "$serial" "${wattage} W" "false"
+        ((index++))
+    done
+
+    if [[ $index -eq 1 ]]; then
+        echo "  No PSUs detected via lshw"
     fi
 }
 
@@ -3264,7 +3174,8 @@ _process_psu_device() {
     [[ -n "$location" ]] && [[ "$location" != "Not Specified" ]] && bay_name="$location"
 
     # Ensure manufacturer exists
-    _ensure_manufacturer "$manufacturer"
+    _ensure_manufacturer "$manufacturer" || return 1
+    manufacturer="$_CANONICAL_MANUFACTURER"
 
     # Parse max power (e.g., "800 W" → 800)
     local wattage=1
