@@ -21,11 +21,12 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 * Detect if server is a VM
   * Associate hypervisor devices to the virtualization cluster
   * Associate virtual machines to the hypervisor device
-* Create chassis and blade through standard tools (`dmidecode`)
+* Create chassis and blade through standard tools (`lshw`)
   * Handle blade moving (new slot, new chassis)
 * Update existing `Device` and `Interface`
   * Handle changes in physical disk, RAM
 * Automatic cabling (server's interface to switch's interface) using lldp
+* Tetect and create `Platform` (OS)
 
 # Requirements
 

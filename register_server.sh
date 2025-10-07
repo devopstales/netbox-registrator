@@ -18,6 +18,8 @@ fi
 DEVICE_NAME=$(hostname -f)
 DEVICE_TYPE=""
 CHASSIS_TYPE=""
+BAY_NUMBER=""
+CHASSIS_NAME=""
 SERIAL=""
 ASSET_TAG=""
 COMMENTS=""
@@ -108,6 +110,10 @@ _debug_print() {
     if [[ "$DEBUG" == true ]]; then
         echo "DEBUG: $*" >&2
     fi
+}
+
+_print() {
+    echo "$*" >&2
 }
 
 # Make API requests
@@ -204,14 +210,204 @@ _ensure_manufacturer() {
 }
 
 #######################################################################################
+## Chassis
+#######################################################################################
+
+_extract_chassis_and_bay_from_hostname() {
+    local hostname="$(hostname -s)"
+
+    # Initialize from config if provided
+    if [[ -n "${DEFAULT_CHASSIS_NAME:-}" ]]; then
+        CHASSIS_NAME="$DEFAULT_CHASSIS_NAME"
+    fi
+    if [[ -n "${DEFAULT_DEVICE_BAY_NUMBER:-}" ]]; then
+        BAY_NUMBER="$DEFAULT_DEVICE_BAY_NUMBER"
+    fi
+
+    # If both are already set via config, we're done
+    if [[ -n "${CHASSIS_NAME:-}" ]] && [[ -n "${BAY_NUMBER:-}" ]]; then
+        return 0
+    fi
+
+    # Match pattern: <chassis>b<number> (e.g., blade03b5)
+    if [[ "$hostname" =~ ^([a-zA-Z][a-zA-Z0-9]*)b([0-9]+)$ ]]; then
+        CHASSIS_NAME="${BASH_REMATCH[1]}"
+        BAY_NUMBER="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    # Optional: support uppercase B (e.g., blade03B5)
+    if [[ "$hostname" =~ ^([a-zA-Z][a-zA-Z0-9]*)B([0-9]+)$ ]]; then
+        CHASSIS_NAME="${BASH_REMATCH[1]}"
+        BAY_NUMBER="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+_ensure_chassis_device() {
+    local site_id="$1"
+    local chassis_name="$2"
+    local chassis_role_id=$(_get_role_id "Chassis")  
+
+    local resp=$(_api_request "GET" "dcim/devices" "?name=$chassis_name" "")
+    _debug_print "$resp"
+    local chassis_id=$(echo "$resp" | jq -r '.results[0].id // empty')
+
+    if [[ -z "$chassis_id" ]]; then
+        # Create chassis device type if needed
+        local chassis_type_id=$(_get_device_type_id "$CHASSIS_TYPE")
+        if [[ -z "$chassis_type_id" ]]; then
+            _print "ERROR: Chassis device type '$CHASSIS_TYPE' not found!" >&2
+            exit 1
+        fi
+
+        # Create chassis device
+        local payload=$(jq -n \
+            --arg name "$chassis_name" \
+            --argjson device_type "$chassis_type_id" \
+            --argjson site "$site_id" \
+            --argjson role "$chassis_role_id" \
+            '{name: $name, device_type: $device_type, site: $site, role: $role, status: "active"}')
+
+        if [[ "$DRY_RUN" == false ]]; then
+            local create_resp=$(_api_request "POST" "dcim/devices" "" "$payload")
+            chassis_id=$(echo "$create_resp" | jq -r '.id')
+            _print "Created chassis: $chassis_name (ID: $chassis_id)"
+        else
+            _print "Chassis '$chassis_name' would be created"
+            chassis_id="DRY_RUN"
+        fi
+    else
+        _print "Chassis already exists: $chassis_name (ID: $chassis_id)"
+    fi
+
+    echo "$chassis_id"
+}
+
+#######################################################################################
 ## Device
 #######################################################################################
+
+_ensure_blade_chassis_role() {
+    local role_name="$1"
+    local slug=$(echo $role_name | tr '[:upper:]' '[:lower:]')
+    local color="9e9e9e"  # Gray (matches your existing "Chassis" role)
+
+    # Check if role already exists by name
+    local response
+    response=$(_api_request "GET" "dcim/device-roles" "?name=$(printf '%s' "$role_name" | jq -sRr '@uri')" "")
+    local count
+    count=$(echo "$response" | jq -r '.count // 0')
+
+    if [[ "$count" -gt 0 ]]; then
+        local existing_id
+        existing_id=$(echo "$response" | jq -r '.results[0].id')
+        _print "Device role '$role_name' already exists (ID: $existing_id)"
+        return 0
+    fi
+
+    # Role doesn't exist – create it
+    _print "Creating device role: $role_name"
+    local payload
+    payload=$(jq -n \
+        --arg name "$role_name" \
+        --arg slug "$slug" \
+        --arg color "$color" \
+        '{name: $name, slug: $slug, color: $color, vm_role: false}')
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create device role '$role_name'"
+        echo "DRY_RUN_ID"
+        return 0
+    fi
+
+    local create_resp
+    create_resp=$(_api_request "POST" "dcim/device-roles" "" "$payload")
+    local new_id
+    new_id=$(echo "$create_resp" | jq -r '.id // empty')
+
+    if [[ -z "$new_id" ]]; then
+        _print "ERROR: Failed to create device role '$role_name'" >&2
+        _debug_print "API response: $create_resp"
+        exit 1
+    fi
+
+    _print "Created device role '$role_name' (ID: $new_id)"
+    echo "$new_id"
+}
+
+_ensure_blade_chassis_roles() {
+    _ensure_blade_chassis_role "Blade"
+    _ensure_blade_chassis_role "Server"
+    _ensure_blade_chassis_role "Chassis"
+}
 
 _check_device_exists() {
     local device_name="$1"
     local response
     response=$(_api_request "GET" "dcim/devices" "?name=$device_name" "")
     echo "$response" | jq -r '.results[0].id // empty'
+}
+
+_ensure_device_bays() {
+    local chassis_id="$1"
+    local chassis_name="$2"
+    local bay_name="$3"  # e.g., "Bay 3"
+
+    local resp=$(_api_request "GET" "dcim/device-bays" "?device_id=$chassis_id&name=$bay_name" "")
+    local count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -eq 0 ]] && [[ "$DRY_RUN" == false ]]; then
+        local payload=$(jq -n --arg name "$bay_name" --argjson device "$chassis_id" \
+            '{name: $name, device: $device}')
+
+        local create_resp=$(_api_request "POST" "dcim/device-bays" "" "$payload")
+        
+        # Check for the specific error about device bays not supported
+        if echo "$create_resp" | jq -e '."__all__" // empty' >/dev/null; then
+            local error_msg
+            error_msg=$(echo "$create_resp" | jq -r '."__all__"[0]')
+            if [[ "$error_msg" == *"does not support device bays"* ]]; then
+                _print "ERROR: Cannot create device bay '$bay_name' in chassis '$chassis_name' (ID: $chassis_id)."
+                _print "       The device type 'SYS-2027TR-H72RF' must have 'Subdevice Role = Parent' in NetBox."
+                _print "       Please update the device type in NetBox and try again."
+                exit 1
+            fi
+        fi
+        echo "Created device bay: $bay_name in chassis $chassis_name"
+    elif [[ "$count" -gt 0 ]]; then
+        echo "Device bay already exists: $bay_name in chassis $chassis_name"
+    fi
+}
+
+_get_device_bay_id() {
+    local chassis_id="$1"
+    local bay_name="$2"
+    local encoded_bay_name
+    encoded_bay_name=$(printf '%s' "$bay_name" | jq -sRr 'split("\n") | .[0] | @uri')
+    
+    local response
+    response=$(_api_request "GET" "dcim/device-bays" "?device_id=$chassis_id&name=$encoded_bay_name" "")
+    
+    local count
+    count=$(echo "$response" | jq -r '.count // 0')
+    
+    if [[ "$count" -eq 0 ]]; then
+        _debug_print "Device bay '$bay_name' not found in chassis ID $chassis_id"
+        echo ""
+        return 1
+    fi
+    
+    local bay_id
+    bay_id=$(echo "$response" | jq -r '.results[0].id // empty')
+    
+    if [[ -z "$bay_id" ]]; then
+        _debug_print "Failed to extract ID for device bay '$bay_name'"
+        echo ""
+        return 1
+    fi
+    
+    echo "$bay_id"
 }
 
 # Create device payload helper
@@ -222,6 +418,8 @@ _create_device_payload() {
     local role_id="$4"
     local comments_payload="$5"
     local existing_device_id="$6"
+    local chassis_id="${7:-}"
+    local bay_id="${8:-}"
 
     local json_data="{"
     json_data="${json_data}\"name\":\"$DEVICE_NAME\","
@@ -238,6 +436,13 @@ _create_device_payload() {
         json_data="${json_data}\"asset_tag\":\"$ASSET_TAG\","
     fi
 
+    if [[ -n "$chassis_id" ]]; then
+        json_data="${json_data}\"parent_device\":$chassis_id,"
+    fi
+    if [[ -n "$bay_id" ]]; then
+        json_data="${json_data}\"device_bay\":$bay_id,"
+    fi
+
     json_data="${json_data}\"comments\":\"$comments_payload\""
 
     if [[ "$is_update" == "true" ]]; then
@@ -249,6 +454,10 @@ _create_device_payload() {
 }
 
 create_devices() {
+    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG") device_type_id CHASSIS_ID BAY_ID role_id
+
+    _ensure_blade_chassis_roles
+
     # Auto-detect device type if enabled
     if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
         _detect_device_type
@@ -256,6 +465,32 @@ create_devices() {
         if [[ -z "$DEVICE_TYPE" ]]; then
             echo "Error: Device type is required." >&2
             exit 1
+        fi
+        if [[ -n "$CHASSIS_TYPE" ]]; then
+
+            # Try to extract chassis name and bay from hostname
+            if _extract_chassis_and_bay_from_hostname; then
+                if [[ -z "$BAY_NUMBER" ]] || [[ -z "$CHASSIS_NAME" ]]; then
+                    echo "ERROR: Failed to extract chassis or bay number." >&2
+                    echo "Extracted from hostname: chassis='$CHASSIS_NAME', bay='$BAY_NUMBER'" >&2
+                    exit 1
+                fi
+
+                echo "Extracted from hostname: chassis='$CHASSIS_NAME', bay='$BAY_NUMBER'"
+                BAY_NAME="Bay-$BAY_NUMBER"
+            else
+                echo "ERROR: Blade detected but hostname does not match '<chassis>b<number>' pattern (e.g., blade03b5)" >&2
+                exit 1
+            fi
+
+            CHASSIS_ID=$(_ensure_chassis_device "$site_id" $CHASSIS_NAME)
+            _ensure_device_bays "$CHASSIS_ID" "$CHASSIS_NAME" "$BAY_NAME"
+            device_type_id=$(_get_device_type_id "$CHASSIS_TYPE")
+            BAY_ID=$(_get_device_bay_id "$CHASSIS_ID" "$BAY_NAME")
+            role_id=$(_get_role_id "Blade")
+        else
+            device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
+            role_id=$(_get_role_id "Server")
         fi
     fi
 
@@ -268,11 +503,6 @@ create_devices() {
             echo "Detected serial number: $SERIAL"
         fi
     fi
-
-    # Get required IDs
-    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG")
-    local role_id=$(_get_role_id "$DEFAULT_ROLE")
-    local device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
 
     if [[ -z "$device_type_id" ]]; then
         echo "ERROR: Device Type dose not exists: $DEVICE_TYPE"
@@ -289,13 +519,13 @@ create_devices() {
     echo ""
     if [[ -n "$existing_device_id" ]]; then
         echo "Device '$DEVICE_NAME' already exists (ID: $existing_device_id). Updating..."
-        PAYLOAD=$(_create_device_payload "true" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "$existing_device_id")
+        PAYLOAD=$(_create_device_payload "true" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "$existing_device_id" "$CHASSIS_ID" "$BAY_ID")
         RESPONSE=$(_api_request "PUT" "dcim/devices/$existing_device_id" "" "$PAYLOAD")
         DEVICE_ID="$existing_device_id"
         echo "Device updated successfully!"
     else
         echo "Creating new device '$DEVICE_NAME'..."
-        PAYLOAD=$(_create_device_payload "false" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "")
+        PAYLOAD=$(_create_device_payload "false" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "" "$CHASSIS_ID" "$BAY_ID")
         RESPONSE=$(_api_request "POST" "dcim/devices" "" "$PAYLOAD")
         DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
         echo "Device created successfully!"
@@ -328,6 +558,10 @@ _detect_device_type() {
     # Clean system product (remove " (To be filled...)")
     local clean_sys="${sys_product%% (*}"
 
+    # Strip trailing '+' from both
+    mb_product="${mb_product%+}"
+    clean_sys="${clean_sys%+}"
+
     # Blade detection patterns (case-insensitive, but we use literal match)
     local blade_patterns=(
         'SBI-' 'SBA-'
@@ -336,15 +570,15 @@ _detect_device_type() {
     )
 
     local blade_mb_patterns=(
-        '^X[5-8]' '^P4'
+        '^X[5-9]' '^P4'
     )
 
     # Check system product for blade indicators
     for pat in "${blade_patterns[@]}"; do
         if [[ "$clean_sys" == *"$pat"* ]]; then
-            echo "system_type: blade"
-            echo "system_model: $mb_product"
-            echo "chassis_type: $clean_sys"
+            echo "  system_type: blade"
+            echo "  system_model: $mb_product"
+            echo "  chassis_type: $clean_sys"
             if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
                 DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
             else
@@ -363,9 +597,9 @@ _detect_device_type() {
     # Check motherboard product
     for pat in "${blade_mb_patterns[@]}"; do
         if [[ "$mb_product" =~ $pat ]]; then
-            echo "system_type: blade"
-            echo "system_model: $mb_product"
-            echo "chassis_type: $clean_sys"
+            echo "  system_type: blade"
+            echo "  system_model: $mb_product"
+            echo "  chassis_type: $clean_sys"
             if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
                 DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
             else
@@ -382,9 +616,9 @@ _detect_device_type() {
     done
 
     # Otherwise: standalone
-    echo "system_type: standalone"
-    echo "system_model: $mb_product"
-    echo "chassis_type: N/A"
+    echo "  system_type: standalone"
+    echo "  system_model: $mb_product"
+    echo "  chassis_type: N/A"
 
     if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
         DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
