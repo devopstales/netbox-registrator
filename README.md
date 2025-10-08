@@ -7,12 +7,14 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 # Features
 
 * Read Configs from config file or enviroment variable
-* Create servers through standard tools (`dmidecode`)
+* Create servers, chassis and blade through standard tools (`lshw`)
+  * Handle blade moving (new slot, new chassis)
 * Create physical, bonding and bridge network interfaces with IPs (IPv4 & IPv6)
   * Create IPMI interface if found
 * Update existing `Device` and `Interface`
 * Local inventory using `Modules` for CPU, GPU, RAM, physical disks, Raid Controller, SAS Controller
 * PSUs creation and power consumption reporting (based on vendor's tools)
+* Tetect and create `Platform` (OS)
 
 # Missing Features
 
@@ -21,12 +23,9 @@ The goal is to generate an existing infrastructure on Netbox and have the abilit
 * Detect if server is a VM
   * Associate hypervisor devices to the virtualization cluster
   * Associate virtual machines to the hypervisor device
-* Create chassis and blade through standard tools (`lshw`)
-  * Handle blade moving (new slot, new chassis)
 * Update existing `Device` and `Interface`
   * Handle changes in physical disk, RAM
 * Automatic cabling (server's interface to switch's interface) using lldp
-* Tetect and create `Platform` (OS)
 
 # Requirements
 

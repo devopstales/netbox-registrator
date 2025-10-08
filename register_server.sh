@@ -724,11 +724,13 @@ _detect_network_interfaces() {
     
     if command -v ip >/dev/null 2>&1; then
         # Get all interfaces except loopback
-        ip -br link show | awk '$1 != "lo" && $1 !~ /^docker/ && $1 !~ /^veth/ && $1 !~ /^br-/ && $1 !~ /^virbr/ {print $1}'
+        ip -br link show | awk '$1 != "lo" && $1 !~ /^docker/ && $1 !~ /^tap/ && $1 !~ /^fw/ && $1 !~ /^ovs/ && $1 !~ /^veth/ && $1 !~ /^br-/ && $1 !~ /^virbr/ {print $1}'
     elif [[ -d "/sys/class/net" ]]; then
         for interface in /sys/class/net/*; do
             interface_name=$(basename "$interface")
-            if [[ "$interface_name" != "lo" ]] && [[ "$interface_name" != docker* ]] && [[ "$interface_name" != veth* ]] && [[ "$interface_name" != br-* ]] && [[ "$interface_name" != virbr* ]]; then
+            if [[ "$interface_name" != "lo" ]] && [[ "$interface_name" != docker* ]] && [[ "$interface_name" != veth* ]] \
+            && [[ "$interface_name" != tap* ]] && [[ "$interface_name" != fw* ]] && [[ "$interface_name" != ovs* ]] \
+            && [[ "$interface_name" != br-* ]] && [[ "$interface_name" != virbr* ]]; then
                 echo "$interface_name"
             fi
         done
@@ -2072,7 +2074,7 @@ _create_cpu_module_in_netbox() {
     declare -A cpu_module_bay_id_map
 
     echo "Detecting CPU Items..."
-    _gather_cpu_for_netbox "$device_id"
+    _gather_cpu_for_netbox "$device_id" || return 1
 
     echo "  Creating CPU modules in NetBox for device ID: $device_id"
 
