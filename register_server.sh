@@ -279,6 +279,7 @@ _ensure_chassis_device() {
         fi
     else
         _print "Chassis already exists: $chassis_name (ID: $chassis_id)"
+
     fi
 
     echo "$chassis_id"
@@ -418,8 +419,6 @@ _create_device_payload() {
     local role_id="$4"
     local comments_payload="$5"
     local existing_device_id="$6"
-    local chassis_id="${7:-}"
-    local bay_id="${8:-}"
 
     local json_data="{"
     json_data="${json_data}\"name\":\"$DEVICE_NAME\","
@@ -436,13 +435,6 @@ _create_device_payload() {
         json_data="${json_data}\"asset_tag\":\"$ASSET_TAG\","
     fi
 
-    if [[ -n "$chassis_id" ]]; then
-        json_data="${json_data}\"parent_device\":$chassis_id,"
-    fi
-    if [[ -n "$bay_id" ]]; then
-        json_data="${json_data}\"device_bay\":$bay_id,"
-    fi
-
     json_data="${json_data}\"comments\":\"$comments_payload\""
 
     if [[ "$is_update" == "true" ]]; then
@@ -450,11 +442,13 @@ _create_device_payload() {
     fi
 
     json_data="${json_data}}"
+    _debug_print "Device Payload: $json_data"
     echo "$json_data"
 }
 
 create_devices() {
-    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG") device_type_id CHASSIS_ID BAY_ID role_id
+    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG") device_type_id role_id
+    local CHASSIS_ID="" BAY_ID="" BAY_NAME=""
 
     _ensure_blade_chassis_roles
 
@@ -485,14 +479,14 @@ create_devices() {
 
             CHASSIS_ID=$(_ensure_chassis_device "$site_id" $CHASSIS_NAME)
             _ensure_device_bays "$CHASSIS_ID" "$CHASSIS_NAME" "$BAY_NAME"
-            device_type_id=$(_get_device_type_id "$CHASSIS_TYPE")
             BAY_ID=$(_get_device_bay_id "$CHASSIS_ID" "$BAY_NAME")
             role_id=$(_get_role_id "Blade")
         else
-            device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
             role_id=$(_get_role_id "Server")
         fi
     fi
+
+    device_type_id=$(_get_device_type_id "$DEVICE_TYPE")
 
     # Auto-detect serial if not provided
     if [[ -z "$SERIAL" ]]; then
@@ -519,16 +513,24 @@ create_devices() {
     echo ""
     if [[ -n "$existing_device_id" ]]; then
         echo "Device '$DEVICE_NAME' already exists (ID: $existing_device_id). Updating..."
-        PAYLOAD=$(_create_device_payload "true" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "$existing_device_id" "$CHASSIS_ID" "$BAY_ID")
+        PAYLOAD=$(_create_device_payload "true" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "$existing_device_id")
         RESPONSE=$(_api_request "PUT" "dcim/devices/$existing_device_id" "" "$PAYLOAD")
         DEVICE_ID="$existing_device_id"
         echo "Device updated successfully!"
     else
         echo "Creating new device '$DEVICE_NAME'..."
-        PAYLOAD=$(_create_device_payload "false" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "" "$CHASSIS_ID" "$BAY_ID")
+        PAYLOAD=$(_create_device_payload "false" "$device_type_id" "$site_id" "$role_id" "$comments_payload" "")
         RESPONSE=$(_api_request "POST" "dcim/devices" "" "$PAYLOAD")
         DEVICE_ID=$(echo "$RESPONSE" | jq -r '.id')
         echo "Device created successfully!"
+    fi
+
+    if [[ -n "$CHASSIS_ID" ]] && [[ -n "$BAY_ID" ]]; then
+        # Install the device into the bay by updating the bay
+        local bay_patch_payload="{\"installed_device\":$DEVICE_ID}"
+        _debug_print "Installing device $DEVICE_ID into bay $BAY_ID"
+        _api_request "PATCH" "dcim/device-bays/$BAY_ID" "" "$bay_patch_payload"
+        _print "Device installed into bay successfully."
     fi
 }
 
@@ -573,57 +575,61 @@ _detect_device_type() {
         '^X[5-9]' '^P4'
     )
 
-    # Check system product for blade indicators
+    local is_blade=0
+
+    # Check system product
     for pat in "${blade_patterns[@]}"; do
         if [[ "$clean_sys" == *"$pat"* ]]; then
-            echo "  system_type: blade"
-            echo "  system_model: $mb_product"
-            echo "  chassis_type: $clean_sys"
-            if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
-                DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
-            else
-                DEVICE_TYPE=$mb_product
-            fi
-            if [[ -n "$DEFAULT_CHASSIS_TYPE" ]]; then
-                CHASSIS_TYPE=$DEFAULT_CHASSIS_TYPE
-                echo "DEFAULT_CHASSIS_TYPE"
-            else
-                CHASSIS_TYPE=$clean_sys
-            fi
-            return 0
+            is_blade=1
+            break
         fi
     done
 
-    # Check motherboard product
-    for pat in "${blade_mb_patterns[@]}"; do
-        if [[ "$mb_product" =~ $pat ]]; then
-            echo "  system_type: blade"
-            echo "  system_model: $mb_product"
-            echo "  chassis_type: $clean_sys"
-            if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
-                DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
-            else
-                DEVICE_TYPE=$mb_product
+    # Check motherboard
+    if [[ $is_blade -eq 0 ]]; then
+        for pat in "${blade_mb_patterns[@]}"; do
+            if [[ "$mb_product" =~ $pat ]]; then
+                is_blade=1
+                break
             fi
-            if [[ -n "$DEFAULT_CHASSIS_TYPE" ]]; then
-                CHASSIS_TYPE=$DEFAULT_CHASSIS_TYPE
-                echo "DEFAULT_CHASSIS_TYPE"
-            else
-                CHASSIS_TYPE=$clean_sys
-            fi
-            return 0
+        done
+    fi
+
+    if [[ $is_blade -eq 1 ]]; then
+        echo "system_type: blade"
+        echo "system_model: $mb_product"
+
+        # Determine chassis_type: prefer detected, fallback to default
+        if [[ -n "$DEFAULT_CHASSIS_TYPE" ]]; then
+            CHASSIS_TYPE="$DEFAULT_CHASSIS_TYPE"
+        elif [[ "$clean_sys" != "Super Server" ]] && [[ "$clean_sys" != "To Be Filled By O.E.M." ]] && [[ -n "$clean_sys" ]]; then
+            CHASSIS_TYPE="$clean_sys"
+        else
+            CHASSIS_TYPE="$clean_sys"
         fi
-    done
 
-    # Otherwise: standalone
-    echo "  system_type: standalone"
-    echo "  system_model: $mb_product"
-    echo "  chassis_type: N/A"
+        echo "chassis_type: $CHASSIS_TYPE"
 
-    if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
-        DEVICE_TYPE=$DEFAULT_DEVICE_TYPE
+        # Set DEVICE_TYPE to motherboard (blade type)
+        if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
+            DEVICE_TYPE="$DEFAULT_DEVICE_TYPE"
+        else
+            DEVICE_TYPE="$mb_product"
+        fi
     else
-        DEVICE_TYPE=$mb_product
+        echo "system_type: standalone"
+        echo "system_model: $mb_product"
+        echo "chassis_type: N/A"
+
+        # Standalone: no chassis, device type = motherboard
+        if [[ -n "$DEFAULT_DEVICE_TYPE" ]]; then
+            DEVICE_TYPE="$DEFAULT_DEVICE_TYPE"
+        else
+            DEVICE_TYPE="$mb_product"
+        fi
+
+        # Do NOT set CHASSIS_TYPE for standalone
+        CHASSIS_TYPE=""
     fi
 }
 
@@ -2289,6 +2295,7 @@ _process_memory_device() {
 
 _create_memory_module_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Detecting Memory Items..."
     _gather_memory_for_netbox "$device_id" || return 1
     _debug_print "Memory Modules: ${memory_modules[@]}"
@@ -2604,6 +2611,7 @@ _process_disk_device() {
 
 _create_disk_module_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Detecting Disk Items..."
     _gather_disks_for_netbox "$device_id" || return 1
 
@@ -2824,6 +2832,7 @@ _process_controller_device() {
 
 _create_controller_module_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Detecting Controller Items..."
     _gather_controllers_for_netbox "$device_id" || return 1
 
@@ -3032,6 +3041,7 @@ _process_gpu_device() {
 
 _create_gpu_module_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Detecting GPU Items..."
     _gather_gpus_for_netbox "$device_id" || return 1
 
@@ -3240,6 +3250,7 @@ _process_nic_device() {
 
 _create_nic_module_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Detecting NIC Items..."
     _gather_nics_for_netbox "$device_id" || return 1
 
@@ -3523,6 +3534,7 @@ _process_psu_device() {
 
 _create_psu_modules_in_netbox() {
     local device_id="$1"
+    echo ""
     echo "Creating PSU Modules and Power Ports in NetBox..."
 
     _gather_psus_for_netbox "$device_id" || return 0
