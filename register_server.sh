@@ -2006,6 +2006,7 @@ _gather_cpu_for_netbox() {
         fi
         ((i++))
     done
+    return 0
 }
 
 _process_cpu_device() {
@@ -2026,12 +2027,12 @@ _process_cpu_device() {
     local core_count=${cores:-0}
     local thread_count=${threads:-$core_count}
     local clock_speed=0
-    if [[ -n "$speed" ]]; then
-        clock_speed=$(echo "$speed" | sed 's/[^0-9.]*//g')
-        # Convert MHz to GHz if needed
-        if (( $(echo "$clock_speed > 10000" | bc -l 2>/dev/null || echo "0") )); then
-            clock_speed=$(echo "scale=2; $clock_speed / 1000" | bc -l 2>/dev/null)
-        fi
+    if [[ -n "$speed" ]] && [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )); then
+        # Convert Hz to GHz (e.g., 3800000000 → 3.80)
+        clock_speed=$(echo "scale=2; $speed / 1000000000" | bc -l 2>/dev/null)
+        # Remove trailing zeros and decimal point if whole number
+        clock_speed=$(echo "$clock_speed" | sed 's/\.0*$//' | sed 's/0*$//')
+        [[ -z "$clock_speed" ]] && clock_speed=0
     fi
 
     # CPU model name
@@ -2071,7 +2072,7 @@ _create_cpu_module_in_netbox() {
     declare -A cpu_module_bay_id_map
 
     echo "Detecting CPU Items..."
-    _gather_cpu_for_netbox "$device_id" || return 1
+    _gather_cpu_for_netbox "$device_id"
 
     echo "  Creating CPU modules in NetBox for device ID: $device_id"
 
