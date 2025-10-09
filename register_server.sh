@@ -210,6 +210,83 @@ _ensure_manufacturer() {
 }
 
 #######################################################################################
+## Detect OS
+#######################################################################################
+
+_detect_and_ensure_platform() {
+    local device_id="$1"  # Optional: used only if updating device later
+    local platform_name=""
+
+    # --- 1. Try /etc/os-release (most reliable) ---
+    if [[ -f /etc/os-release ]]; then
+        # Source safely without polluting global env
+        local os_name os_id os_version_id
+        os_name=$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+
+        if [[ -n "$os_name" ]]; then
+            platform_name="$os_name"
+        else
+            platform_name="Linux"
+        fi
+    fi
+
+    # Trim and normalize
+    platform_name=$(_trim "$platform_name")
+    if [[ -z "$platform_name" ]]; then
+        _debug_print "Could not detect OS platform"
+        return 1
+    fi
+
+    _debug_print "Detected OS platform: '$platform_name'"
+
+    # --- 4. Ensure platform exists in NetBox ---
+    local slug
+    slug=$(echo "$platform_name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-_' | tr -s '-' | sed 's/-$//; s/^-//')
+
+    # Check if platform exists by name
+    local resp
+    resp=$(_api_request "GET" "dcim/platforms" "?name=$(printf '%s' "$platform_name" | jq -sRr '@uri')" "")
+    local count
+    count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -gt 0 ]]; then
+        local existing_id
+        existing_id=$(echo "$resp" | jq -r '.results[0].id')
+        _debug_print "Platform '$platform_name' already exists (ID: $existing_id)"
+        echo "$existing_id"
+        return 0
+    fi
+
+    # Platform doesn't exist – create it
+    _debug_print "Creating platform: $platform_name (slug: $slug)"
+    local payload
+    payload=$(jq -n \
+        --arg name "$platform_name" \
+        --arg slug "$slug" \
+        '{name: $name, slug: $slug}')
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create platform '$platform_name'"
+        echo "DRY_RUN_ID"
+        return 0
+    fi
+
+    local create_resp
+    create_resp=$(_api_request "POST" "dcim/platforms" "" "$payload")
+    local new_id
+    new_id=$(echo "$create_resp" | jq -r '.id // empty')
+
+    if [[ -z "$new_id" ]]; then
+        _print "ERROR: Failed to create platform '$platform_name'" >&2
+        _debug_print "API response: $create_resp"
+        return 1
+    fi
+
+    _print "Created platform: $platform_name (ID: $new_id)"
+    echo "$new_id"
+}
+
+#######################################################################################
 ## Chassis
 #######################################################################################
 
@@ -303,7 +380,7 @@ _ensure_blade_chassis_role() {
     if [[ "$count" -gt 0 ]]; then
         local existing_id
         existing_id=$(echo "$response" | jq -r '.results[0].id')
-        _print "Device role '$role_name' already exists (ID: $existing_id)"
+        _print "  Device role '$role_name' already exists (ID: $existing_id)"
         return 0
     fi
 
@@ -333,11 +410,12 @@ _ensure_blade_chassis_role() {
         exit 1
     fi
 
-    _print "Created device role '$role_name' (ID: $new_id)"
+    _print "  Created device role '$role_name' (ID: $new_id)"
     echo "$new_id"
 }
 
 _ensure_blade_chassis_roles() {
+    _print "Ensuring device roles: Blade, Server, Chassis"
     _ensure_blade_chassis_role "Blade"
     _ensure_blade_chassis_role "Server"
     _ensure_blade_chassis_role "Chassis"
@@ -450,8 +528,6 @@ create_devices() {
     local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG") device_type_id role_id
     local CHASSIS_ID="" BAY_ID="" BAY_NAME=""
 
-    _ensure_blade_chassis_roles
-
     # Auto-detect device type if enabled
     if [[ "$AUTO_DETECT" == true && -z "$DEVICE_TYPE" ]]; then
         _detect_device_type
@@ -532,6 +608,16 @@ create_devices() {
         _api_request "PATCH" "dcim/device-bays/$BAY_ID" "" "$bay_patch_payload"
         _print "Device installed into bay successfully."
     fi
+
+    # After getting DEVICE_ID
+    PLATFORM_ID=$(_detect_and_ensure_platform "$DEVICE_ID")
+    if [[ -n "$PLATFORM_ID" ]] && [[ "$PLATFORM_ID" != "DRY_RUN_ID" ]]; then
+        # Update device with platform
+        local update_payload="{\"platform\":$PLATFORM_ID}"
+        _api_request "PATCH" "dcim/devices/$DEVICE_ID" "" "$update_payload" >/dev/null
+        _print "Assigned platform ID $PLATFORM_ID to device $DEVICE_ID"
+    fi
+
 }
 
 
@@ -541,6 +627,7 @@ create_devices() {
 
 # Function to detect device type automatically
 _detect_device_type() {
+    echo ""
     echo "Starting device type detection..."
     local lshw_json sys_product mb_product
     lshw_json=$(lshw -quiet -json 2>/dev/null)
@@ -3675,9 +3762,6 @@ _ensure_module_type_profiles() {
 create_modules() {
     local device_id="$1"
 
-    echo ""
-    _ensure_module_type_profiles
-
     _create_cpu_module_in_netbox "$device_id"
     _create_memory_module_in_netbox "$device_id"
     _create_disk_module_in_netbox "$device_id"
@@ -3688,24 +3772,522 @@ create_modules() {
 }
 
 #######################################################################################
+## VM Cluster 
+#######################################################################################
+
+_ensure_cluster_type() {
+    local cluster_type_name="Proxmox"
+    local slug="proxmox"
+
+    # URL-encode the name for API query
+    local encoded_name
+    encoded_name=$(printf '%s' "$cluster_type_name" | jq -sRr 'split("\n") | .[0] | @uri')
+
+    # Check if cluster type already exists
+    local resp
+    resp=$(_api_request "GET" "virtualization/cluster-types" "?name=$encoded_name" "")
+    local count
+    count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -gt 0 ]]; then
+        local existing_id
+        existing_id=$(echo "$resp" | jq -r '.results[0].id')
+        _debug_print "Cluster type '$cluster_type_name' already exists (ID: $existing_id)"
+        echo "$existing_id"
+        return 0
+    fi
+
+    # Create cluster type
+    _debug_print "  Creating virtualization cluster type: $cluster_type_name"
+    local payload
+    payload=$(jq -n \
+        --arg name "$cluster_type_name" \
+        --arg slug "$slug" \
+        '{name: $name, slug: $slug}')
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create cluster type '$cluster_type_name'"
+        echo "DRY_RUN_ID"
+        return 0
+    fi
+
+    local create_resp
+    create_resp=$(_api_request "POST" "virtualization/cluster-types" "" "$payload")
+    local new_id
+    new_id=$(echo "$create_resp" | jq -r '.id // empty')
+
+    if [[ -z "$new_id" ]]; then
+        _print "ERROR: Failed to create cluster type '$cluster_type_name'" >&2
+        _debug_print "API response: $create_resp"
+        return 1
+    fi
+
+    _print "Created cluster type: $cluster_type_name (ID: $new_id)"
+    echo "$new_id"
+}
+
+_detect_proxmox_cluster_name() {
+    local cluster_name=""
+    if [[ -f /etc/pve/corosync.conf ]]; then
+        # Extract cluster_name from corosync.conf (inside quorum or totem block)
+        cluster_name=$(awk '/^[[:space:]]*cluster_name:/ {gsub(/^[[:space:]]*cluster_name:[[:space:]]*/, ""); gsub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit}' /etc/pve/corosync.conf)
+    fi
+    if [[ -z "$cluster_name" ]]; then
+        # Fallback: use hostname if not in a cluster
+        cluster_name=$(hostname -s)
+    fi
+    echo "$cluster_name"
+}
+
+_ensure_proxmox_virtualization_cluster() {
+    local device_id="$1"
+    local cluster_name="$2"
+    local site_id="$3"
+    local cluster_type_id="$4"
+
+    # URL-encode cluster name for API query
+    local encoded_name
+    encoded_name=$(printf '%s' "$cluster_name" | jq -sRr 'split("\n") | .[0] | @uri')
+
+    # Check if cluster already exists
+    local resp
+    resp=$(_api_request "GET" "virtualization/clusters" "?name=$encoded_name" "")
+    local count
+    count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -gt 0 ]]; then
+        local existing_id
+        existing_id=$(echo "$resp" | jq -r '.results[0].id')
+        _print "Virtualization cluster '$cluster_name' already exists (ID: $existing_id)"
+        echo "$existing_id"
+        return 0
+    fi
+
+    # Create cluster
+    _print "Creating virtualization cluster: $cluster_name"
+    local payload
+    payload=$(jq -n \
+        --arg name "$cluster_name" \
+        --argjson type_id "$cluster_type_id" \
+        --argjson site_id "$site_id" \
+        '{name: $name, type: $type_id, site: $site_id}')
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create virtualization cluster '$cluster_name'"
+        echo "DRY_RUN_ID"
+        return 0
+    fi
+
+    local create_resp
+    create_resp=$(_api_request "POST" "virtualization/clusters" "" "$payload")
+    local new_id
+    new_id=$(echo "$create_resp" | jq -r '.id // empty')
+
+    if [[ -z "$new_id" ]]; then
+        _print "ERROR: Failed to create virtualization cluster '$cluster_name'" >&2
+        _debug_print "API response: $create_resp"
+        return 1
+    fi
+
+    _print "  Created virtualization cluster: $cluster_name (ID: $new_id)"
+    echo "$new_id"
+}
+
+#######################################################################################
+## VM
+#######################################################################################
+
+_create_virtual_disks_for_vm() {
+    local vm_id="$1"
+    local scsi0="$2"
+    local virtio0="$3"
+
+    # Process disk strings like: "vm-prod-hdd:base-101-disk-0,iothread=1,size=32G"
+    local disk_spec
+    for disk_spec in "$scsi0" "$virtio0"; do
+        [[ -z "$disk_spec" ]] && continue
+
+        # Extract volume ID (e.g., base-101-disk-0)
+        local volume_id
+        volume_id=$(echo "$disk_spec" | cut -d',' -f1 | cut -d':' -f2)
+        [[ -z "$volume_id" ]] && continue
+
+        # Extract size (e.g., 32G → 32)
+        local size_str size_gb
+        size_str=$(echo "$disk_spec" | grep -o 'size=[^,]*' | cut -d'=' -f2)
+        if [[ -n "$size_str" ]]; then
+            # Remove non-digit chars, assume GB
+            size_gb=$(echo "$size_str" | sed 's/[a-zA-Z]//g')
+            [[ -z "$size_gb" ]] && size_gb=1
+        else
+            size_gb=1
+        fi
+
+        # Check if virtual disk already exists
+        local encoded_name
+        encoded_name=$(printf '%s' "$volume_id" | jq -sRr 'split("\n") | .[0] | @uri')
+        local disk_resp
+        disk_resp=$(_api_request "GET" "virtualization/virtual-disks" "?name=$encoded_name&virtual_machine_id=$vm_id" "")
+        local disk_count
+        disk_count=$(echo "$disk_resp" | jq -r '.count // 0')
+
+        local disk_payload
+        disk_payload=$(jq -n \
+            --arg name "$volume_id" \
+            --argjson vm "$vm_id" \
+            --argjson size "$size_gb" \
+            '{"name": $name, "virtual_machine": $vm, "size": $size}')
+
+        if [[ "$DRY_RUN" == true ]]; then
+            _print "  DRY RUN: Would create virtual disk '$volume_id' (${size_gb} GB)"
+        else
+            if [[ "$disk_count" -eq 0 ]]; then
+                _api_request "POST" "virtualization/virtual-disks" "" "$disk_payload" >/dev/null
+                _print "  Created virtual disk: $volume_id (${size_gb} GB)"
+            else
+                _print "  Virtual disk already exists: $volume_id"
+            fi
+        fi
+    done
+}
+
+_detect_proxmox_vm_configs() {
+    local vmid
+    find /etc/pve/qemu-server/ -maxdepth 1 -name "*.conf" -type f | while read -r f; do
+        vmid=$(basename "$f" .conf)
+        if [[ "$vmid" =~ ^[0-9]+$ ]]; then
+            _debug_print "Found VM config: $f (VMID: $vmid)"
+            echo "$vmid"
+        fi
+    done
+}
+
+_sync_proxmox_vm_to_netbox() {
+    local vmid="$1"
+    local cluster_id="$2"
+    local site_id="$3"
+    local config_file="/etc/pve/qemu-server/${vmid}.conf"
+    local name="" cores="" sockets="" memory="" scsi0="" virtio0="" vcpus=1 onboot="" status="offline" vm_id=""
+
+    if [[ ! -f "$config_file" ]]; then
+        _debug_print "VM config not found: $config_file"
+        return 1
+    fi
+
+    # --- Parse only needed fields ---
+    name=$(awk -F ':' '/^name:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    cores=$(awk -F ':' '/^cores:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    sockets=$(awk -F ':' '/^sockets:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    memory=$(awk -F ':' '/^memory:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    scsi0=$(awk -F ':' '/^scsi0:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    virtio0=$(awk -F ':' '/^virtio0:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+
+    local vcpus=$((cores * sockets))
+
+    # Status: 'onboot: 1' → active, else offline
+    local onboot=$(awk -F '=' '/^onboot:/ {print $2; exit}' "$config_file" | xargs)
+    local status="offline"
+    [[ "$onboot" == "1" ]] && status="active"
+
+    # --- Check if VM already exists by name ---
+    local encoded_name
+    encoded_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
+    local vm_resp
+    vm_resp=$(_api_request "GET" "virtualization/virtual-machines" "?name=$encoded_name" "")
+    local vm_count
+    vm_count=$(echo "$vm_resp" | jq -r '.count // 0')
+
+    if [[ "$vm_count" -gt 0 ]]; then
+        vm_id=$(echo "$vm_resp" | jq -r '.results[0].id')
+        _debug_print "VM '$name' already exists (ID: $vm_id). Updating..."
+    else
+        _debug_print "Creating VM: $name"
+    fi
+
+    # --- Build VM payload ---
+    local vm_payload
+    vm_payload=$(jq -n \
+        --arg name "$name" \
+        --argjson cluster "$cluster_id" \
+        --argjson site "$site_id" \
+        --argjson vcpus "$vcpus" \
+        --argjson memory "$memory" \
+        --arg status "$status" \
+        --arg serial "$vmid" \
+        '{
+            name: $name,
+            cluster: $cluster,
+            site: $site,
+            vcpus: $vcpus,
+            memory: $memory,
+            status: $status,
+            serial: $serial
+        }')
+
+    # --- Create or update VM ---
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would sync VM '$name' (vCPUs: $vcpus, RAM: ${memory}MB, Serial: $vmid)"
+        vm_id="DRY_RUN_ID"
+    else
+        if [[ -n "$vm_id" ]]; then
+            vm_payload=$(echo "$vm_payload" | jq --arg id "$vm_id" '. + {id: $id}')
+            _api_request "PUT" "virtualization/virtual-machines/$vm_id/" "" "$vm_payload" >/dev/null
+        else
+            local create_resp
+            create_resp=$(_api_request "POST" "virtualization/virtual-machines" "" "$vm_payload")
+            vm_id=$(echo "$create_resp" | jq -r '.id // empty')
+            if [[ -z "$vm_id" ]]; then
+                _print "ERROR: Failed to create VM '$name'" >&2
+                return 1
+            fi
+        fi
+        _print "Synced VM: $name (ID: $vm_id)"
+    fi
+
+    # --- Extract and create virtual disks ---
+    _create_virtual_disks_for_vm "$vm_id" "$scsi0" "$virtio0"
+
+    echo "$vm_id"
+}
+
+sync_proxmox_vms_to_netbox() {
+    local device_id="$1"
+    local cluster_id="$2"
+    local site_id=$(_get_site_id "$DEFAULT_SITE_SLUG")
+
+    # Only run if Proxmox is detected
+    if ! command -v pveversion >/dev/null 2>&1; then
+        _debug_print "Not a Proxmox host – skipping VM sync"
+        return 0
+    fi
+
+    echo ""
+    echo "Syncing Proxmox VMs to NetBox..."
+
+    # Get VM list
+    local vmids
+    vmids=$(_detect_proxmox_vm_configs) || return 0
+    _debug_print "Detected VM IDs: $vmids"
+
+    while IFS= read -r vmid; do
+        if [[ -n "$vmid" ]]; then
+            _debug_print "Processing VM ID: $vmid"
+            if ! _sync_proxmox_vm_to_netbox "$vmid" "$cluster_id" "$site_id"; then
+                _print "ERROR: Failed to sync VM $vmid. Continuing..." >&2
+            fi
+        fi
+    done <<< "$vmids"
+
+    echo "VM sync completed."
+}
+
+#######################################################################################
+## Application Services
+#######################################################################################
+
+_create_application_service_template() {
+    local name="$1"
+    local port="$2"
+
+    # Validate inputs
+    if [[ -z "$name" ]] || [[ -z "$port" ]]; then
+        _debug_print "ERROR: Service template name and port are required"
+        return 1
+    fi
+
+    # URL-encode ONLY for GET query
+    local encoded_name
+    encoded_name=$(printf '%s' "$name" | jq -sRr 'split("\n") | .[0] | @uri')
+
+    # Check if template already exists
+    local resp
+    resp=$(_api_request "GET" "ipam/service-templates" "?name=$encoded_name" "")
+    local count
+    count=$(echo "$resp" | jq -r '.count // 0')
+
+    if [[ "$count" -gt 0 ]]; then
+        local existing_id
+        existing_id=$(echo "$resp" | jq -r '.results[0].id')
+        _debug_print "Application service template '$name' already exists (ID: $existing_id)"
+        echo "$existing_id"
+        return 0
+    fi
+
+    # Create template (use jq to build VALID JSON)
+    _debug_print "Creating application service template: $name"
+    local payload
+    payload=$(jq -n \
+        --arg name "$name" \
+        --arg protocol "tcp" \
+        --argjson ports "[$port]" \
+        '{name: $name, protocol: $protocol, ports: $ports}')
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create application service template '$name'"
+        echo "DRY_RUN_ID"
+        return 0
+    fi
+
+    local create_resp
+    create_resp=$(_api_request "POST" "ipam/service-templates" "" "$payload")
+    local new_id
+    new_id=$(echo "$create_resp" | jq -r '.id // empty')
+
+    if [[ -z "$new_id" ]]; then
+        _print "ERROR: Failed to create application service template '$name'" >&2
+        _debug_print "API response: $create_resp"
+        return 1
+    fi
+
+    _print "Created application service template: $name (ID: $new_id)"
+    echo "$new_id"
+}
+
+_create_application_service() {
+    local device_id="$1"
+    local template_id="$2"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "DRY RUN: Would create service from template ID $template_id on device $device_id"
+        return 0
+    fi
+
+    # Get template details to determine name/ports
+    local template_resp
+    template_resp=$(_api_request "GET" "ipam/service-templates/$template_id" "" "")
+    _debug_print "Service template response: $template_resp"
+    local service_name
+    service_name=$(echo "$template_resp" | jq -r '.name // empty')
+    local ports
+    ports=$(echo "$template_resp" | jq -r '.ports | join(",")')
+
+    # Check if service already exists on device
+    local encoded_name
+    encoded_name=$(printf '%s' "$service_name" | jq -sRr 'split("\n") | .[0] | @uri')
+    local existing_resp
+    existing_resp=$(_api_request "GET" "ipam/services" "?device_id=$device_id&name=$encoded_name" "")
+    _debug_print "Existing service check response: $existing_resp"
+    local existing_count
+    existing_count=$(echo "$existing_resp" | jq -r '.count // 0')
+
+    if [[ "$existing_count" -gt 0 ]]; then
+        _debug_print "Service '$service_name' already exists on device $device_id"
+        return 0
+    fi
+
+    # Create service
+    local payload
+    payload=$(jq -n \
+        --arg name "$service_name" \
+        --arg device "dcim.device" \
+        --arg protocol "tcp" \
+        --argjson device_id "$device_id" \
+        --argjson service_template "$template_id" \
+        --argjson ports "[$ports]" \
+        '{name: $name, parent_object_type: $device, protocol: $protocol, parent_object_id: $device_id, service_template: $service_template, ports: $ports}')
+    _debug_print "Service creation payload: $payload"
+
+    local create_resp
+    create_resp=$(_api_request "POST" "ipam/services" "" "$payload")
+    _debug_print "Service creation response: $create_resp"
+    if echo "$create_resp" | jq -e '.id' >/dev/null 2>&1; then
+        local svc_id
+        svc_id=$(echo "$create_resp" | jq -r '.id')
+        _print "  Created service '$service_name' (ID: $svc_id) on device $device_id"
+    else
+        _print "ERROR: Failed to create service '$service_name'" >&2
+        _debug_print "API response: $create_resp"
+        return 1
+    fi
+}
+
+detect_pve_pbs() {
+    local device_id="$1"
+
+    _print ""
+    _print "Detecting Proxmox VE / Proxmox Backup Server..."
+
+    # Detect Proxmox VE
+    if [[ -d "/etc/pve" ]]; then
+        pve_version=$(pveversion | awk -F '/' '{print $2}' | awk -F '.' '{print $1"."$2}')
+        if [[ -n "$pve_version" ]]; then
+            _print "  Detected Proxmox VE version: $pve_version"
+            local svc_name="Proxmox Virtual Environment $pve_version"
+            local template_id
+            template_id=$(_create_application_service_template "$svc_name" "8006")
+            if [[ -n "$template_id" ]] && [[ "$template_id" != "DRY_RUN_ID" ]]; then
+                _create_application_service "$device_id" "$template_id"
+            fi
+
+            CLUSTER_TYPE_ID=$(_ensure_cluster_type)
+            if [[ -n "$CLUSTER_TYPE_ID" ]] && [[ "$CLUSTER_TYPE_ID" != "DRY_RUN_ID" ]]; then
+                SITE_ID=$(_get_site_id "$DEFAULT_SITE_SLUG")
+                CLUSTER_NAME=$(_detect_proxmox_cluster_name)
+                CLUSTER_ID=$(_ensure_proxmox_virtualization_cluster "$DEVICE_ID" "$CLUSTER_NAME" "$SITE_ID" "$CLUSTER_TYPE_ID")
+                
+                # Optional: Assign device to cluster
+                if [[ -n "$CLUSTER_ID" ]] && [[ "$CLUSTER_ID" != "DRY_RUN_ID" ]]; then
+                    _debug_print "Assigning device $DEVICE_ID to cluster $CLUSTER_ID"
+                    local patch_payload="{\"cluster\":$CLUSTER_ID}"
+                    _api_request "PATCH" "dcim/devices/$DEVICE_ID/" "" "$patch_payload" >/dev/null
+                    _print "  Device assigned to cluster: $CLUSTER_NAME (ID: $CLUSTER_ID)"
+                fi
+
+                sync_proxmox_vms_to_netbox "$DEVICE_ID" "$CLUSTER_ID"
+            fi
+        fi
+    fi
+
+    # Detect Proxmox Backup Server
+    if [[ -d "/etc/proxmox-backup" ]]; then
+        pbs_version=$(proxmox-backup-client version | awk '{print $3}' | awk -F '.' '{print $1"."$2}')
+        if [[ -n "$pbs_version" ]]; then
+            _print "  Detected Proxmox Backup Server version: $pbs_version"
+            local svc_name="Proxmox Backup Server $pbs_version"
+            local template_id
+            template_id=$(_create_application_service_template "$svc_name" "8007")
+            if [[ -n "$template_id" ]] && [[ "$template_id" != "DRY_RUN_ID" ]]; then
+                _create_application_service "$device_id" "$template_id"
+            fi
+        fi
+    fi
+}
+
+#######################################################################################
+## Dependences
+#######################################################################################
+
+create_preconditional_objects() {
+
+    echo ""
+    _ensure_module_type_profiles
+    _ensure_blade_chassis_roles
+}
+
+#######################################################################################
 # Main execution
 #######################################################################################
 echo "Starting server registration in NetBox..."
+
+# Precondition
+create_preconditional_objects
+
 # Create Device
 create_devices
 
 # Create module items
-create_modules "$DEVICE_ID"
+#create_modules "$DEVICE_ID"
 
 # Create Network Interface MAC and IP
-detect_and_create_network_interfaces "$DEVICE_ID"
+#detect_and_create_network_interfaces "$DEVICE_ID"
 # Create Console Port
-create_ipmi_interface "$DEVICE_ID"
+#create_ipmi_interface "$DEVICE_ID"
 
 # Get LLDP neighbors in JSON format
 #get_lldp_neighbors "$DEVICE_ID"
 
-
+# Detect Proxmox services
+detect_pve_pbs "$DEVICE_ID"
 
 echo ""
 echo "Server registration completed!"
