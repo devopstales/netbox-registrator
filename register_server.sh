@@ -163,6 +163,49 @@ _trim() {
     printf '%s' "$var"
 }
 
+convert_to_mb() {
+    local size_str="$1"
+    local num unit
+
+    # Default to 1 MB if empty or invalid
+    if [[ -z "$size_str" ]]; then
+        echo 1
+        return
+    fi
+
+    # Extract number and unit (case-insensitive)
+    if [[ $size_str =~ ^([0-9]+)([a-zA-Z]*)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2],,}"  # lowercase
+    else
+        # Fallback: assume it's a number in GB if only digits
+        if [[ $size_str =~ ^[0-9]+$ ]]; then
+            num="$size_str"
+            unit="g"
+        else
+            echo 1
+            return
+        fi
+    fi
+
+    # Convert to MB
+    case "$unit" in
+        ""|"m")  # no unit or M → MB
+            echo "$num"
+            ;;
+        "g")     # G → GB to MB
+            echo $(( num * 1000 ))
+            ;;
+        "t")     # T → TB to MB
+            echo $(( num * 1000 * 1000 ))
+            ;;
+        *)       # unknown unit → assume GB
+            _print "Warning: Unknown size unit '$unit', assuming GB"
+            exit 1
+            ;;
+    esac
+}
+
 #######################################################################################
 ## Manufacturer
 #######################################################################################
@@ -368,6 +411,7 @@ _ensure_chassis_device() {
 
 _ensure_blade_chassis_role() {
     local role_name="$1"
+    local is_vm_role="$2"
     local slug=$(echo $role_name | tr '[:upper:]' '[:lower:]')
     local color="9e9e9e"  # Gray (matches your existing "Chassis" role)
 
@@ -391,7 +435,14 @@ _ensure_blade_chassis_role() {
         --arg name "$role_name" \
         --arg slug "$slug" \
         --arg color "$color" \
-        '{name: $name, slug: $slug, color: $color, vm_role: false}')
+        --argjson is_vm_role "$is_vm_role" \
+        '{
+            name: $name, 
+            slug: $slug, 
+            color: $color, 
+            vm_role: $is_vm_role
+        }'
+    )
 
     if [[ "$DRY_RUN" == true ]]; then
         _print "DRY RUN: Would create device role '$role_name'"
@@ -416,9 +467,10 @@ _ensure_blade_chassis_role() {
 
 _ensure_blade_chassis_roles() {
     _print "Ensuring device roles: Blade, Server, Chassis"
-    _ensure_blade_chassis_role "Blade"
-    _ensure_blade_chassis_role "Server"
-    _ensure_blade_chassis_role "Chassis"
+    _ensure_blade_chassis_role "Blade" false
+    _ensure_blade_chassis_role "Server" false
+    _ensure_blade_chassis_role "Chassis" false
+    _ensure_blade_chassis_role "Template" true
 }
 
 _check_device_exists() {
@@ -3899,56 +3951,35 @@ _ensure_proxmox_virtualization_cluster() {
 
 _create_virtual_disks_for_vm() {
     local vm_id="$1"
-    local scsi0="$2"
-    local virtio0="$3"
+    local disk_names="$2" # (e.g., base-101-disk-0)
+    local disk_size_gb="$3"
 
-    # Process disk strings like: "vm-prod-hdd:base-101-disk-0,iothread=1,size=32G"
-    local disk_spec
-    for disk_spec in "$scsi0" "$virtio0"; do
-        [[ -z "$disk_spec" ]] && continue
+    # Check if virtual disk already exists
+    local encoded_name
+    encoded_name=$(printf '%s' "$disk_names" | jq -sRr 'split("\n") | .[0] | @uri')
+    local disk_resp
+    disk_resp=$(_api_request "GET" "virtualization/virtual-disks" "?name=$encoded_name&virtual_machine_id=$vm_id" "")
+    local disk_count
+    disk_count=$(echo "$disk_resp" | jq -r '.count // 0')
 
-        # Extract volume ID (e.g., base-101-disk-0)
-        local volume_id
-        volume_id=$(echo "$disk_spec" | cut -d',' -f1 | cut -d':' -f2)
-        [[ -z "$volume_id" ]] && continue
+    local disk_payload
+    disk_payload=$(jq -n \
+        --arg name "$disk_names" \
+        --argjson vm "$vm_id" \
+        --argjson size "$disk_size_gb" \
+        '{"name": $name, "virtual_machine": $vm, "size": $size}')
 
-        # Extract size (e.g., 32G → 32)
-        local size_str size_gb
-        size_str=$(echo "$disk_spec" | grep -o 'size=[^,]*' | cut -d'=' -f2)
-        if [[ -n "$size_str" ]]; then
-            # Remove non-digit chars, assume GB
-            size_gb=$(echo "$size_str" | sed 's/[a-zA-Z]//g')
-            [[ -z "$size_gb" ]] && size_gb=1
+    if [[ "$DRY_RUN" == true ]]; then
+        _print "  DRY RUN: Would create virtual disk '$disk_names' (${disk_size_gb} GB)"
+    else
+        if [[ "$disk_count" -eq 0 ]]; then
+            _api_request "POST" "virtualization/virtual-disks" "" "$disk_payload" >/dev/null
+            _print "  Created virtual disk: $disk_names (${disk_size_gb} GB)"
         else
-            size_gb=1
+            _print "  Virtual disk already exists: $disk_names"
         fi
+    fi
 
-        # Check if virtual disk already exists
-        local encoded_name
-        encoded_name=$(printf '%s' "$volume_id" | jq -sRr 'split("\n") | .[0] | @uri')
-        local disk_resp
-        disk_resp=$(_api_request "GET" "virtualization/virtual-disks" "?name=$encoded_name&virtual_machine_id=$vm_id" "")
-        local disk_count
-        disk_count=$(echo "$disk_resp" | jq -r '.count // 0')
-
-        local disk_payload
-        disk_payload=$(jq -n \
-            --arg name "$volume_id" \
-            --argjson vm "$vm_id" \
-            --argjson size "$size_gb" \
-            '{"name": $name, "virtual_machine": $vm, "size": $size}')
-
-        if [[ "$DRY_RUN" == true ]]; then
-            _print "  DRY RUN: Would create virtual disk '$volume_id' (${size_gb} GB)"
-        else
-            if [[ "$disk_count" -eq 0 ]]; then
-                _api_request "POST" "virtualization/virtual-disks" "" "$disk_payload" >/dev/null
-                _print "  Created virtual disk: $volume_id (${size_gb} GB)"
-            else
-                _print "  Virtual disk already exists: $volume_id"
-            fi
-        fi
-    done
 }
 
 _detect_proxmox_vm_configs() {
@@ -3963,31 +3994,93 @@ _detect_proxmox_vm_configs() {
 }
 
 _sync_proxmox_vm_to_netbox() {
-    local vmid="$1"
-    local cluster_id="$2"
-    local site_id="$3"
-    local config_file="/etc/pve/qemu-server/${vmid}.conf"
-    local name="" cores="" sockets="" memory="" scsi0="" virtio0="" vcpus=1 onboot="" status="offline" vm_id=""
+    local device_id="$1"
+    local vmid="$2"
+    local cluster_id="$3"
+    local site_id="$4"
 
-    if [[ ! -f "$config_file" ]]; then
-        _debug_print "VM config not found: $config_file"
+    if [[ -z "$vmid" ]]; then
+        _debug_print "Error: VMID is required." >&2
         return 1
     fi
 
-    # --- Parse only needed fields ---
-    name=$(awk -F ':' '/^name:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
-    cores=$(awk -F ':' '/^cores:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
-    sockets=$(awk -F ':' '/^sockets:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
-    memory=$(awk -F ':' '/^memory:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
-    scsi0=$(awk -F ':' '/^scsi0:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
-    virtio0=$(awk -F ':' '/^virtio0:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$config_file")
+    # Run qm config and capture output
+    local config_output
+    config_output=$(qm config "$vmid" 2>/dev/null)
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "Error: Failed to retrieve config for VMID $vmid (qm exit code: $exit_code)." >&2
+        return $exit_code
+    fi
+
+    # Initialize variables
+    local name=""
+    local cores=""
+    local sockets=""
+    local memory=""
+    local -a disk_names=()
+    local -a disk_sizes=()
+    local is_template=""
+
+    # First pass: get main VM attributes
+    while IFS= read -r line; do
+        key="${line%%:*}"
+        value="${line#*: }"
+        case "$key" in
+            name)     name="$value" ;;
+            cores)    cores="$value" ;;
+            sockets)  sockets="$value" ;;
+            memory)   memory="$value" ;;
+            template) is_template="$value" ;;
+        esac
+    done <<< "$config_output"
+
+    # Second pass: extract disks
+    while IFS= read -r line; do
+        if [[ $line =~ ^(virtio|scsi|ide)[0-9]+: ]]; then
+            disk_part="${line#*: }"
+            # Skip CD/DVD placeholders
+            if [[ "$disk_part" == *"media=cdrom"* ]]; then
+                continue
+            fi
+
+            # Extract storage:volume (e.g., "local-lvm:vm-8250-disk-0")
+            storage_vol="${disk_part%%,*}"
+            if [[ "$storage_vol" != *:* ]]; then
+                continue
+            fi
+
+            local disk_name="${storage_vol#*:}"
+
+            # Extract size
+            local disk_size=""
+            IFS=',' read -ra params <<< "${disk_part#*,}"
+            for param in "${params[@]}"; do
+                if [[ $param == size=* ]]; then
+                    disk_size="${param#size=}"
+                    break
+                fi
+            done
+
+            if [[ -n "$disk_name" ]]; then
+                disk_names+=("$disk_name")
+                disk_sizes+=("$disk_size")
+            fi
+        fi
+    done <<< "$config_output"
 
     local vcpus=$((cores * sockets))
-
-    # Status: 'onboot: 1' → active, else offline
-    local onboot=$(awk -F '=' '/^onboot:/ {print $2; exit}' "$config_file" | xargs)
-    local status="offline"
-    [[ "$onboot" == "1" ]] && status="active"
+    local vm_status=$(qm status "$vmid" | awk '{print $2}')
+    if [[ "$vm_status" == "running" ]]; then
+        status="active"
+    else
+        status="offline"
+    fi
+    if [[ "$is_template" == 1 ]]; then
+        profile="Template"
+    else
+        profile=""
+    fi
 
     # --- Check if VM already exists by name ---
     local encoded_name
@@ -4001,6 +4094,7 @@ _sync_proxmox_vm_to_netbox() {
         vm_id=$(echo "$vm_resp" | jq -r '.results[0].id')
         _debug_print "VM '$name' already exists (ID: $vm_id). Updating..."
     else
+        vm_id=""
         _debug_print "Creating VM: $name"
     fi
 
@@ -4014,6 +4108,8 @@ _sync_proxmox_vm_to_netbox() {
         --argjson memory "$memory" \
         --arg status "$status" \
         --arg serial "$vmid" \
+        --arg device "$device_id" \
+        --arg profile "$profile" \
         '{
             name: $name,
             cluster: $cluster,
@@ -4021,7 +4117,9 @@ _sync_proxmox_vm_to_netbox() {
             vcpus: $vcpus,
             memory: $memory,
             status: $status,
-            serial: $serial
+            serial: $serial,
+            device: $device,
+            profile: $profile
         }')
 
     # --- Create or update VM ---
@@ -4045,7 +4143,13 @@ _sync_proxmox_vm_to_netbox() {
     fi
 
     # --- Extract and create virtual disks ---
-    _create_virtual_disks_for_vm "$vm_id" "$scsi0" "$virtio0"
+    for i in "${!disk_names[@]}"; do
+        disk_name="${disk_names[i]}"
+        disk_size_str="${disk_sizes[i]}"
+
+        disk_size_mb=$(convert_to_mb "$disk_size_str")
+        _create_virtual_disks_for_vm "$vm_id" "$disk_name" "$disk_size_mb"
+    done
 
     echo "$vm_id"
 }
@@ -4072,7 +4176,7 @@ sync_proxmox_vms_to_netbox() {
     while IFS= read -r vmid; do
         if [[ -n "$vmid" ]]; then
             _debug_print "Processing VM ID: $vmid"
-            if ! _sync_proxmox_vm_to_netbox "$vmid" "$cluster_id" "$site_id"; then
+            if ! _sync_proxmox_vm_to_netbox "$device_id" "$vmid" "$cluster_id" "$site_id"; then
                 _print "ERROR: Failed to sync VM $vmid. Continuing..." >&2
             fi
         fi
@@ -4270,10 +4374,10 @@ create_preconditional_objects() {
 echo "Starting server registration in NetBox..."
 
 # Precondition
-create_preconditional_objects
+#create_preconditional_objects
 
 # Create Device
-create_devices
+#create_devices
 
 # Create module items
 #create_modules "$DEVICE_ID"
@@ -4291,3 +4395,4 @@ detect_pve_pbs "$DEVICE_ID"
 
 echo ""
 echo "Server registration completed!"
+
