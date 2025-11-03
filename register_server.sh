@@ -4374,18 +4374,18 @@ create_preconditional_objects() {
 echo "Starting server registration in NetBox..."
 
 # Precondition
-#create_preconditional_objects
+create_preconditional_objects
 
 # Create Device
-#create_devices
+create_devices
 
 # Create module items
-#create_modules "$DEVICE_ID"
+create_modules "$DEVICE_ID"
 
 # Create Network Interface MAC and IP
-#detect_and_create_network_interfaces "$DEVICE_ID"
+detect_and_create_network_interfaces "$DEVICE_ID"
 # Create Console Port
-#create_ipmi_interface "$DEVICE_ID"
+create_ipmi_interface "$DEVICE_ID"
 
 # Get LLDP neighbors in JSON format
 #get_lldp_neighbors "$DEVICE_ID"
@@ -4395,4 +4395,5 @@ detect_pve_pbs "$DEVICE_ID"
 
 echo ""
 echo "Server registration completed!"
+
 
